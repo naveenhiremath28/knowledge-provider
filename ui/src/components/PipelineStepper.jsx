@@ -16,10 +16,19 @@ import { cn } from '../lib/utils'
 // would leave every finished document looking stuck.
 const PROD_ONLY_STEPS = new Set(['approval_for_prod', 'ingesting_prod', 'publishing_to_network'])
 
+// Publishing to the network also needs PUBLISH_TO_NETWORK; without it the
+// backend leaves the stage out of /pipeline/stages and so does the stepper.
+const NETWORK_PUBLISH_STEP = 'publishing_to_network'
+
 function resolveEffectiveIndex(stages, currentStage, hasPages, hasChunks) {
   const isFailed = currentStage === 'failed'
   const userStepId = mapStageToUserStep(currentStage)
   let effectiveIndex = stages.findIndex(stage => stage.id === userStepId)
+  if (effectiveIndex < 0 && userStepId === NETWORK_PUBLISH_STEP) {
+    // Stage is hidden but the document still passes through it briefly; keep
+    // showing the previous step as active instead of jumping back to the start.
+    effectiveIndex = stages.findIndex(stage => stage.id === 'ingesting_prod')
+  }
 
   if (isFailed) {
     // Approximate where failure happened so completed steps stay checked.
@@ -48,10 +57,13 @@ function stageStatus(index, effectiveIndex, isFailed) {
 }
 
 export default function PipelineStepper({ currentStage, hasPages = false, hasChunks = false, className }) {
-  const { prodEnabled } = usePipelineConfig()
+  const { prodEnabled, networkPublishEnabled } = usePipelineConfig()
   const stages = React.useMemo(
-    () => (prodEnabled ? USER_PIPELINE_STAGES : USER_PIPELINE_STAGES.filter(s => !PROD_ONLY_STEPS.has(s.id))),
-    [prodEnabled],
+    () =>
+      USER_PIPELINE_STAGES.filter(
+        s => (prodEnabled || !PROD_ONLY_STEPS.has(s.id)) && (networkPublishEnabled || s.id !== NETWORK_PUBLISH_STEP),
+      ),
+    [prodEnabled, networkPublishEnabled],
   )
   const { isFailed, effectiveIndex } = resolveEffectiveIndex(stages, currentStage, hasPages, hasChunks)
   const total = stages.length

@@ -496,6 +496,42 @@ class TestOCRActivity:
 class TestPublishCatalogToNetworkActivity:
     """Tests for the publish_catalog_to_network activity (thin wrapper over DiscoveryPublishService)."""
 
+    @pytest.fixture(autouse=True)
+    def _publishing_on(self, monkeypatch):
+        # Publishing is off by default; these tests exercise the publish path.
+        monkeypatch.setenv("PUBLISH_TO_NETWORK", "true")
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_publish_off_skips_without_building_the_service(self, monkeypatch):
+        import pipeline.activities as activities
+        import pipeline.db as db
+
+        monkeypatch.delenv("PUBLISH_TO_NETWORK", raising=False)
+
+        class ExplodingService:
+            def __init__(self):
+                raise AssertionError("service must not be built while publishing is off")
+
+        monkeypatch.setattr(activities, "DiscoveryPublishService", ExplodingService)
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *a, **k: ("minio://documents/network_publish_skipped.json", 45, "application/json"),
+        )
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "advisory"})
+        monkeypatch.setattr(db, "get_latest_document_job", lambda workflow_id: None)
+
+        recorded = {}
+        monkeypatch.setattr(db, "add_document_artifact", lambda **kwargs: recorded.update(kwargs))
+
+        result = await activities.publish_catalog_to_network("wf-5", "txn-5")
+
+        assert result["status"] == "skipped"
+        assert result["message_id"] is None
+        assert recorded["artifact_type"] == "network_publish_skipped"
+        assert recorded["metadata"]["reason"] == "PUBLISH_TO_NETWORK is off"
+
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_publish_records_artifact_on_success(self, monkeypatch):

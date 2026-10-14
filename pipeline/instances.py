@@ -35,6 +35,19 @@ def prod_stage_disabled() -> bool:
     return (os.environ.get("DISABLE_PROD_SETTING", "false").strip().lower()
             in {"true", "1", "yes"})
 
+def publish_to_network_enabled() -> bool:
+    """True when PUBLISH_TO_NETWORK turns on the Beckn Discovery Service publish.
+
+    Defaults to off, so a deployment publishes to the network only when it opts
+    in. Unlike ``prod_stage_disabled`` this is read at publish time, inside the
+    ``publish_catalog_to_network`` activity: activities are not replayed, so a
+    flip changes only publishes that have not run yet and never changes the
+    path a replaying workflow takes.
+    """
+    return (os.environ.get("PUBLISH_TO_NETWORK", "false").strip().lower()
+            in {"true", "1", "yes"})
+
+
 INSTANCE_NAMES: dict[str, str] = {
     # Platform
     "bv": "Bharat Vistaar",

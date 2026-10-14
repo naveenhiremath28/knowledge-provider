@@ -78,7 +78,7 @@ from .auth.tenancy import (
     unrestricted,
     user_can_access_instance,
 )
-from .instances import prod_stage_disabled
+from .instances import prod_stage_disabled, publish_to_network_enabled
 from .models import (
     PIPELINE_STAGES,
     PROD_ONLY_STAGES,
@@ -1977,8 +1977,6 @@ async def disable_document(
     - Remove all chunks from the DEV vector index
     - Delete PROD Qdrant points too, if this document was ever promoted
       (schemes-index for scheme documents, documents-index otherwise)
-    - Remove the row from the Postgres master catalog and refresh the
-      Redis snapshots the AI layer reads, so a re-ingest starts clean
     - For scheme documents, also rebuild the legacy SQLite scheme catalog
     - Stop the workflow if it is still running
 
@@ -2030,7 +2028,6 @@ async def disable_document(
         "scheme_qdrant_deleted": None,
         "prod_qdrant_deleted": None,
         "catalog_version": None,
-        "master_catalog_version": None,
         "minio_artifacts_deleted": None,
         "sqlite_rows_deleted": None,
     }
@@ -2076,16 +2073,6 @@ async def disable_document(
         else:
             result["prod_qdrant_deleted"] = _delete_document_points_from_prod(doc)
 
-        # Master catalog (Postgres) + Redis snapshot cleanup — mirrors the sync
-        # done on ingest/promote so a deleted document stops appearing to the
-        # AI layer immediately, and a later re-ingest starts from a clean slate.
-        try:
-            from .master_catalog_pg import remove_catalog_entry
-
-            result["master_catalog_version"] = await asyncio.to_thread(remove_catalog_entry, workflow_id)
-        except Exception as exc:
-            result["master_catalog_error"] = str(exc)
-
     # Hard delete: drop the artifacts and the SQLite rows themselves. Ordered
     # storage-then-database so a failure mid-way leaves rows pointing at
     # already-deleted objects (visible, fixable) rather than orphaned objects
@@ -2124,7 +2111,6 @@ async def disable_document(
             "prod_qdrant_deleted": result.get("prod_qdrant_deleted"),
             "scheme_code": doc.get("scheme_code"),
             "catalog_version": result.get("catalog_version"),
-            "master_catalog_version": result.get("master_catalog_version"),
         },
         user=user,
     )
@@ -2364,7 +2350,7 @@ async def reingest_document(
     # (e.g. after an embedding/index change), but a trap if it's used as a
     # substitute for the real approval flow on a never-classified document —
     # it would silently ingest with document_kind='document' and no scheme
-    # metadata, the exact raw-hash/filename-fallback master_catalog rows we've
+    # metadata, the exact raw-hash/filename-fallback catalog rows we've
     # had to clean up by hand. 'document' is never offered as a choice in the
     # classification panel, so seeing it here means classification was never done.
     if (doc.get("document_kind") or "document") == "document" and not doc.get("scheme_code") and not doc.get("scheme_name"):
@@ -4179,14 +4165,17 @@ async def reconcile_document_states(user: RequirePipeline):
 async def get_pipeline_stages(user: RequireSearch):
     """Get the pipeline stages for UI stepper display.
 
-    The PROD stages are omitted when DISABLE_PROD_SETTING is on, so the stepper
-    shows the pipeline the documents will actually follow.
+    The PROD stages are omitted when DISABLE_PROD_SETTING is on, and the
+    network publish stage is omitted unless PUBLISH_TO_NETWORK is on, so the
+    stepper shows the pipeline the documents will actually follow.
     """
     prod_disabled = prod_stage_disabled()
+    network_disabled = not publish_to_network_enabled()
     return [
         {"id": stage[0], "label": stage[1], "description": stage[2]}
         for stage in PIPELINE_STAGES
         if not (prod_disabled and stage[0] in PROD_ONLY_STAGES)
+        and not (network_disabled and stage[0] == "publishing_to_network")
     ]
 
 

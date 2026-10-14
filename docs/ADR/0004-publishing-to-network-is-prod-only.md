@@ -12,3 +12,5 @@ Alternatives considered:
 - **Leave it at DEV-ingest time (status quo).** Rejected: too weak a bar for a live network-facing capability claim.
 - **Gate per-document instead of per-provider-capability.** Not possible: the envelope is structurally kind-level (ADR 0003).
 - **Treat post-promotion publish failure as non-fatal.** Rejected for v1: avoids a new "prod-live but not announced" intermediate document state; revisit if failures become operationally frequent.
+
+Update: publishing is now off unless `PUBLISH_TO_NETWORK` is set; see ADR 0005. The "skipped entirely when `DISABLE_PROD_SETTING=true`" rule above still holds.

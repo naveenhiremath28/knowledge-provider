@@ -10,7 +10,7 @@ Full narrative docs (read these before deep architectural changes, don't re-deri
 - `README.md` — what the system does, API surface, supported inputs, auth model
 - `docs/SYSTEM_DESIGN.md` — C4 diagrams, containers, DEV/PROD indexing, stage/activity table
 - `docs/architecture-pipeline-rbac.md` — login flow, roles, DEV vs Super-Admin-PROD gate
-- `docs/MASTER_SCHEME_CATALOG_AND_AI_SYNC_DESIGN.md` — master catalog → Redis sync to AI layer (bharat-oan-api)
+- `docs/MASTER_SCHEME_CATALOG_AND_AI_SYNC_DESIGN.md` — original scheme catalog design (historical: the Postgres master catalog and Redis push it describes were removed; the pull API `/catalog/v1/*` remains)
 - `ENV.md` — full annotated environment variable reference (`.env.example` for a working template)
 
 ## Commands
@@ -67,7 +67,7 @@ Core modules (all under `pipeline/`):
 - `models.py` — Pydantic models, including `DocumentStage` enum and `PIPELINE_STAGES` (the stepper-UI stage list)
 - `config.py` — `Config` dataclass reading env vars, with defaults
 - `instances.py` — instance/tenant (state) code ↔ human name mapping; `bv` = Bharat Vistaar platform-wide, others are state codes matching Keycloak group paths (`/states/MH/...` → `mh`)
-- `master_catalog_pg.py`, `scheme_catalog.py` — Postgres-backed master scheme catalog, synced to Redis for the AI layer (bharat-oan-api) to consume
+- `scheme_catalog.py` — SQLite-backed scheme catalog behind the pull-based `/catalog/v1/*` API
 - `ocr/`, `translation/`, `chunking/`, `vector_store/` — pluggable provider packages, each with a `base.py` protocol/ABC and a `service.py` (or equivalent) that dispatches to the configured provider
 - `auth/` — Keycloak JWT validation, group-based tenancy/permissions, email-OTP flow, admin user management
 

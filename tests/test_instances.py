@@ -112,3 +112,19 @@ class TestProdOnlyStages:
         stage_ids = [s[0] for s in PIPELINE_STAGES]
         assert stage_ids.index("publishing_to_network") == stage_ids.index("ingesting_prod") + 1
         assert stage_ids.index("publishing_to_network") == stage_ids.index("completed") - 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, False), ("", False), ("false", False), ("0", False),
+     ("true", True), ("TRUE", True), (" 1 ", True), ("yes", True)],
+)
+def test_publish_to_network_enabled(monkeypatch, value, expected):
+    from pipeline.instances import publish_to_network_enabled
+
+    if value is None:
+        monkeypatch.delenv("PUBLISH_TO_NETWORK", raising=False)
+    else:
+        monkeypatch.setenv("PUBLISH_TO_NETWORK", value)
+    assert publish_to_network_enabled() is expected

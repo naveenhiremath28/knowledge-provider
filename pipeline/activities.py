@@ -28,7 +28,7 @@ from .catalog_builder import normalize_document_kind
 from .chunking import chunk_pages, load_chunking_config
 from .discovery_publish_service import DiscoveryPublishService
 from .document_repository import DocumentRepository
-from .instances import instance_display_name
+from .instances import instance_display_name, publish_to_network_enabled
 from .network_constants import RESULT_REJECTED
 from .ocr import ocr_pdf as run_ocr_pdf
 from .ocr import ocr_pdf_in_segments as run_ocr_pdf_in_segments
@@ -1374,12 +1374,6 @@ async def promote_document_to_prod_qdrant(
             catalog_version = on_scheme_document_promoted(workflow_id)
         except Exception as exc:
             activity.logger.warning("Catalog update after promote failed: %s", exc)
-        try:
-            from .master_catalog_pg import sync_catalog_entry
-
-            await asyncio.to_thread(sync_catalog_entry, workflow_id, "live")
-        except Exception as exc:
-            activity.logger.warning("Master catalog (Postgres/Redis) sync after promote failed: %s", exc)
     return {
         **result,
         "collection": prod_collection,
@@ -1443,12 +1437,6 @@ async def ingest_document_from_db(
         status="indexed",
         details=result.get("index_stats"),
     )
-    try:
-        from .master_catalog_pg import sync_catalog_entry
-
-        await asyncio.to_thread(sync_catalog_entry, workflow_id, "dev")
-    except Exception as exc:
-        activity.logger.warning("Master catalog (Postgres/Redis) sync after DEV ingest failed: %s", exc)
     return result
 
 
@@ -1465,10 +1453,23 @@ async def publish_catalog_to_network(workflow_id: str, transaction_id: str) -> d
     repository = DocumentRepository()
     document_kind = normalize_document_kind(repository.get_document_kind(workflow_id))
 
-    service = DiscoveryPublishService()
-    result = await asyncio.to_thread(
-        service.publish, transaction_id, document_kind, workflow_id
-    )
+    if publish_to_network_enabled():
+        service = DiscoveryPublishService()
+        result = await asyncio.to_thread(
+            service.publish, transaction_id, document_kind, workflow_id
+        )
+        skip_reason = "no network catalog is mapped to this document kind"
+    else:
+        # Checked here, not in the workflow, so a replaying workflow never
+        # changes path when the setting flips. No Discovery Service settings
+        # are needed while publishing is off.
+        result = {
+            "skipped": True,
+            "result_status": None,
+            "envelope": None,
+            "errors": [],
+        }
+        skip_reason = "PUBLISH_TO_NETWORK is off"
 
     if result["skipped"]:
         artifact_type = "network_publish_skipped"
@@ -1476,7 +1477,7 @@ async def publish_catalog_to_network(workflow_id: str, transaction_id: str) -> d
         exchange = {
             "skipped": True,
             "document_kind": document_kind,
-            "reason": "no network catalog is mapped to this document kind",
+            "reason": skip_reason,
         }
     else:
         artifact_type = "network_publish_payload"

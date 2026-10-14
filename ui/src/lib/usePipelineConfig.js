@@ -5,12 +5,13 @@ import { fetchJson } from './pipelineUi'
  * Runtime pipeline shape, read once from the backend.
  *
  * `/pipeline/stages` omits the PROD stages when DISABLE_PROD_SETTING is on, so
- * their presence is what tells the UI whether promotion exists at all. Cached
+ * their presence is what tells the UI whether promotion exists at all. It also
+ * omits `publishing_to_network` unless PUBLISH_TO_NETWORK is on. Cached
  * at module level: the flag is deployment-wide and cannot change while the tab
  * is open, so every stepper on the page shares one request.
  */
 
-const DEFAULT_CONFIG = { prodEnabled: true, loaded: false }
+const DEFAULT_CONFIG = { prodEnabled: true, networkPublishEnabled: true, loaded: false }
 
 let cache = null
 let inflight = null
@@ -21,7 +22,11 @@ export function fetchPipelineConfig() {
     inflight = fetchJson('/pipeline/stages')
       .then(stages => {
         const ids = new Set((Array.isArray(stages) ? stages : []).map(s => s.id))
-        cache = { prodEnabled: ids.has('approval_for_prod'), loaded: true }
+        cache = {
+          prodEnabled: ids.has('approval_for_prod'),
+          networkPublishEnabled: ids.has('publishing_to_network'),
+          loaded: true,
+        }
         return cache
       })
       .catch(() => {

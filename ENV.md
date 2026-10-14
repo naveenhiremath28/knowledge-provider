@@ -228,31 +228,15 @@ Exposes `/catalog/v1/*` so **bharat-oan-api** and **bharat-provider-backend** ca
 
 **Endpoints:** `GET /catalog/v1/snapshot`, `/version`, `/schemes`, `/tool-prompt`; `POST /catalog/v1/rebuild`, `/bootstrap`; `PATCH /documents/{id}/scheme-metadata`.
 
-### Master Catalog — Postgres + Redis push (dev preview channel)
-
-Separate from the SQLite/Qdrant catalog above (which tracks PROD vector publication and is scheme-specific). This one is a generic Postgres table (`master_catalog`: code, content_type, name, tool_name, doc_id, prompt_snippet, status) — not scheme-only, since ingested documents can be schemes, advisories, or other kinds that later grow their own code/name/tool metadata. docs-pipeline writes to it on **DEV ingest complete** (`status=dev`) and **PROD promote complete** (`status=live`), then pushes directly into the AI layer's Redis so bharat-oan-api can test an entry's prompt/tool routing in the dev chatbot without an AI-layer redeploy.
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `MASTER_CATALOG_PG_HOST` | *(empty — required)* | Host of your existing Postgres instance. No DB container is provisioned by docker-compose for this — bring your own server and create the database on it (e.g. `CREATE DATABASE master_catalog`). Tables are created automatically on first sync. |
-| `MASTER_CATALOG_PG_PORT` | `5432` | Postgres port |
-| `MASTER_CATALOG_PG_DB` | `master_catalog` | Database name |
-| `MASTER_CATALOG_PG_USER` / `MASTER_CATALOG_PG_PASSWORD` | `master_catalog` / *(empty)* | Credentials |
-| `MASTER_CATALOG_PG_SSLMODE` | `disable` | Use `require` for managed prod Postgres |
-| `AI_LAYER_REDIS_HOST` | *(empty)* | bharat-oan-api's Redis host. Empty = Postgres sync still happens, Redis push is skipped |
-| `AI_LAYER_REDIS_PORT` / `AI_LAYER_REDIS_DB` / `AI_LAYER_REDIS_PASSWORD` | `6379` / `0` / *(empty)* | AI layer Redis connection |
-| `MASTER_CATALOG_REDIS_TTL_SECONDS` | `172800` (48h) | Snapshot key TTL — a dead-man's switch, not a freshness mechanism (writes are push-driven) |
-
-**Redis keys:** `master-catalog:dev:snapshot` (dev + live entries — what the dev chatbot reads), `master-catalog:live:snapshot` (live only — what prod reads). Plain JSON via raw `redis-py`, not routed through bharat-oan-api's `aiocache` layer, since it's an external write contract rather than an internal cache value.
-
 ### Publish to Network
 
-First piece of the network-discovery push architecture: once a document's PROD promotion succeeds, the `publishing_to_network` pipeline stage POSTs a Beckn-shaped `publish` envelope to an external Discovery Service. It's a PROD-only stage (see `docs/ADR/0004-publishing-to-network-is-prod-only.md`) — skipped entirely when `DISABLE_PROD_SETTING=true`, since a document never reaches the network without first promoting to PROD. This is going to be the only way the experience layer discovers schemas going forward — the Master Scheme Catalog pull API above stays in place for backward compatibility. The catalog announces the *knowledge kind* the document was classified as — one catalog with exactly one `OnDemand` resource for `advisory`, another for `scheme`; any other `document_kind` publishes nothing. `DISCOVERY_SERVICE_ENDPOINT` and `NETWORK_SENDER_ID` are **required** whenever PROD promotion is enabled — there is no separate feature flag for this stage beyond `DISABLE_PROD_SETTING`.
+First piece of the network-discovery push architecture: once a document's PROD promotion succeeds, the `publishing_to_network` pipeline stage POSTs a Beckn-shaped `publish` envelope to an external Discovery Service. It's a PROD-only stage (see `docs/ADR/0004-publishing-to-network-is-prod-only.md`) — skipped entirely when `DISABLE_PROD_SETTING=true`, since a document never reaches the network without first promoting to PROD. This is going to be the only way the experience layer discovers schemas going forward — the Master Scheme Catalog pull API above stays in place for backward compatibility. The catalog announces the *knowledge kind* the document was classified as — one catalog with exactly one `OnDemand` resource for `advisory`, another for `scheme`; any other `document_kind` publishes nothing. Publishing is **off by default**: set `PUBLISH_TO_NETWORK=true` to turn it on (see `docs/ADR/0005-publish-to-network-is-opt-in.md`). While it is off the activity records a `network_publish_skipped` artifact and the stage is left out of `GET /pipeline/stages`, so the UI stepper does not show it. `DISCOVERY_SERVICE_ENDPOINT` and `NETWORK_SENDER_ID` are **required only when `PUBLISH_TO_NETWORK` is on**.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DISCOVERY_SERVICE_ENDPOINT` | *(empty — required)* | Base URL of the external Discovery Service; the pipeline POSTs to `{DISCOVERY_SERVICE_ENDPOINT}/publish` |
-| `NETWORK_SENDER_ID` | *(empty — required)* | This instance's Beckn `senderId`, also sent as `networkId` |
+| `PUBLISH_TO_NETWORK` | `false` | Turns the Discovery Service publish on (`true`/`1`/`yes`). Read when the publish activity runs, not when a workflow starts, so changing it never affects the path of a workflow already in flight |
+| `DISCOVERY_SERVICE_ENDPOINT` | *(empty — required when `PUBLISH_TO_NETWORK` is on)* | Base URL of the external Discovery Service; the pipeline POSTs to `{DISCOVERY_SERVICE_ENDPOINT}/publish` |
+| `NETWORK_SENDER_ID` | *(empty — required when `PUBLISH_TO_NETWORK` is on)* | This instance's Beckn `senderId`, also sent as `networkId` |
 | `DISCOVERY_SERVICE_PUBLISH_INITIAL_INTERVAL_SECONDS` | `30` | Wait before the first retry of a failed publish |
 | `DISCOVERY_SERVICE_PUBLISH_BACKOFF_COEFFICIENT` | `2.0` | Multiplier applied to the wait after each retry |
 | `DISCOVERY_SERVICE_PUBLISH_MAX_INTERVAL_SECONDS` | `300` | Cap on the wait between retries |
@@ -269,7 +253,7 @@ First piece of the network-discovery push architecture: once a document's PROD p
 | Temporal / MinIO / SQLite | — | ✅ | ✅ |
 | OCR / translation / chunking / domain tags | — | config / status | ✅ runs jobs |
 | Qdrant (`VECTOR_DB_*`) | — | ✅ | ✅ |
-| Publish to Network (`DISCOVERY_SERVICE_ENDPOINT`, `NETWORK_SENDER_ID`) | — | — | ✅ runs the publish activity |
+| Publish to Network (`PUBLISH_TO_NETWORK`, `DISCOVERY_SERVICE_ENDPOINT`, `NETWORK_SENDER_ID`) | — | ✅ `PUBLISH_TO_NETWORK` only (stage list) | ✅ runs the publish activity |
 
 ---
 

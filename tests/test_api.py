@@ -43,6 +43,21 @@ class TestHealthEndpoints:
         assert len(stages) > 0
         assert all("id" in s and "label" in s for s in stages)
 
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_pipeline_stages_network_publish_follows_toggle(self, test_client, monkeypatch):
+        """publishing_to_network is listed only when PUBLISH_TO_NETWORK is on."""
+        monkeypatch.delenv("DISABLE_PROD_SETTING", raising=False)
+
+        monkeypatch.delenv("PUBLISH_TO_NETWORK", raising=False)
+        off = {s["id"] for s in test_client.get("/pipeline/stages").json()}
+        assert "publishing_to_network" not in off
+        assert "ingesting_prod" in off
+
+        monkeypatch.setenv("PUBLISH_TO_NETWORK", "true")
+        on = {s["id"] for s in test_client.get("/pipeline/stages").json()}
+        assert "publishing_to_network" in on
+
 
 class TestDocumentEndpoints:
     """Tests for document CRUD endpoints."""
