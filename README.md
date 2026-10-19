@@ -205,6 +205,7 @@ It owns:
 - audit logs
 - search settings
 - document/index status
+- inbound webhook records (`webhook_records`, written by `POST /webhook`, `x-api-key` = `WEBHOOK_API_KEY`)
 
 ### MinIO
 
