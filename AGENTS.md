@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A review-driven document ingestion pipeline (product name "Bharat Vistaar Docs Pipeline"): Temporal workflows + FastAPI + SQLite + MinIO + Qdrant. Documents move through explicit stages (OCR → review → translate → review → chunk → review → ingest DEV → Super Admin promote to PROD), with every major output persisted as an inspectable artifact rather than hidden.
+A review-driven document ingestion pipeline (product name "Bharat Vistaar Docs Pipeline"): Temporal workflows + FastAPI + Postgres + MinIO + Qdrant. Documents move through explicit stages (OCR → review → translate → review → chunk → review → ingest DEV → Super Admin promote to PROD), with every major output persisted as an inspectable artifact rather than hidden.
 
 Full narrative docs (read these before deep architectural changes, don't re-derive):
 - `README.md` — what the system does, API surface, supported inputs, auth model
@@ -58,7 +58,7 @@ Core modules (all under `pipeline/`):
 - `workflows.py` — Temporal workflow definitions (`DocumentPipelineWorkflow` is the main one; also `ReingestionWorkflow`, `PromoteToProdWorkflow`, `TranslationOnlyWorkflow`, `OcrOnlyWorkflow`, `ChunkingOnlyWorkflow`)
 - `activities.py` — Temporal activities invoked by the workflows (OCR, translate, chunk, ingest, state updates)
 - `worker.py` — Temporal worker process; registers workflows/activities on task queue `ocr-pipeline`
-- `db.py` — SQLite access layer; SQLite is the **canonical** metadata/review-state store (documents, pages, chunks, jobs, artifacts, audit log), not just a cache
+- `db.py` — Postgres access layer (psycopg3 sync connection pool); Postgres is the **canonical** metadata/review-state store (documents, workflows, pages, chunks, artifacts, audit log, settings), not just a cache. Documents and jobs come back as flat dicts keyed by `workflow_id` (the document's main Temporal workflow id); every function also accepts the document UUID. Schema: `migrations/` (applied at api/worker startup by `migrate.py`), described in `docs/POSTGRES_SCHEMA.md`
 - `document_repository.py` — `DocumentRepository`, a domain layer over `db.py` for document reads; `db.py` stays one-function-per-query with no domain knowledge
 - `network_constants.py` — fixed values sent on the network (catalog/resource ids, topics, languages, Beckn version). The file v2 edits when the AI layer starts deriving them
 - `catalog_builder.py` — pure builder mapping a document's knowledge kind (`advisory`/`scheme`) to the single `OnDemand` Beckn catalog announced for that kind; returns `None` for any other kind. No env, no I/O
@@ -67,7 +67,7 @@ Core modules (all under `pipeline/`):
 - `models.py` — Pydantic models, including `DocumentStage` enum and `PIPELINE_STAGES` (the stepper-UI stage list)
 - `config.py` — `Config` dataclass reading env vars, with defaults
 - `instances.py` — instance/tenant (state) code ↔ human name mapping; `bv` = Bharat Vistaar platform-wide, others are state codes matching Keycloak group paths (`/states/MH/...` → `mh`)
-- `scheme_catalog.py` — SQLite-backed scheme catalog behind the pull-based `/catalog/v1/*` API
+- `scheme_catalog.py` — scheme catalog behind the pull-based `/catalog/v1/*` API, served from the `catalog_entries` table and the computed `catalog` view
 - `ocr/`, `translation/`, `chunking/`, `vector_store/` — pluggable provider packages, each with a `base.py` protocol/ABC and a `service.py` (or equivalent) that dispatches to the configured provider
 - `auth/` — Keycloak JWT validation, group-based tenancy/permissions, email-OTP flow, admin user management
 
@@ -93,7 +93,7 @@ registered → ocr_processing → ocr_review → translation_processing → tran
 
 ### Storage responsibilities (don't blur these)
 
-- **SQLite** — canonical metadata/content/review state (documents, pages, chunks, jobs, artifacts, audit, search settings). Source of truth for anything editable.
+- **Postgres** — canonical metadata/content/review state (documents, workflows, pages, chunks, artifacts, audit, search settings). Source of truth for anything editable.
 - **MinIO** — blob storage for original uploads, normalized files, and stage artifacts (OCR/translation/chunk exports, vector-index payload snapshots).
 - **Temporal** — orchestration/retries/review-gate signaling only; not a content store.
 - **Qdrant** — downstream search projections of approved chunk state; never the place to edit content.
@@ -108,4 +108,4 @@ React 18 + Vite + Tailwind v4 + Radix UI operator console (not a plain upload fo
 
 ### Scripts (`scripts/`)
 
-Operational tools, not one-off hacks — e.g. `list_failed_workflows.py`, `terminate_stuck_workflows.py`, `keycloak_bootstrap_docs_pipeline.py`, `drop_legacy_marqo_columns.py`. Check here before writing a new maintenance script — an equivalent likely exists.
+Operational tools, not one-off hacks — e.g. `list_failed_workflows.py`, `terminate_stuck_workflows.py`, `keycloak_bootstrap_docs_pipeline.py`, `migrate_sqlite_to_postgres.py`. Check here before writing a new maintenance script — an equivalent likely exists.

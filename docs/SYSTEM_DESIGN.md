@@ -39,7 +39,7 @@ gate before **PROD**.
 | Multi-state tenancy | `documents.instance` + JWT groups; lists/search scoped |
 | DEV before PROD | Stage 9 writes DEV index; stage 10 waits; Super Admin promotes to PROD |
 | Operability | Runs, queue, audit, reconcile, artifacts UI |
-| Durable long work | Temporal retries + SQLite state mirror |
+| Durable long work | Temporal retries + Postgres state mirror |
 
 ### Non-goals
 - Real-time chat / low-latency LLM product surface  
@@ -98,7 +98,7 @@ flowchart TB
   end
 
   subgraph Data
-    SQLITE[("SQLite WAL<br/>documents.db")]
+    PGDB[("Postgres<br/>documents, workflows, pages, chunks")]
     MINIO[("MinIO<br/>objects")]
     QDEV[("Qdrant DEV index<br/>vector + lexical")]
     QPROD[("Qdrant PROD<br/>production vectors")]
@@ -111,13 +111,13 @@ flowchart TB
   UI -->|"/api + Bearer JWT"| API
   UI -.->|OIDC PKCE| KC
   API -->|JWKS| KC
-  API --> SQLITE
+  API --> PGDB
   API --> MINIO
   API --> QDEV
   API -->|start / signal| TEMP
   TEMP --> TEMPDB
   TEMP --> WORKER
-  WORKER --> SQLITE
+  WORKER --> PGDB
   WORKER --> MINIO
   WORKER --> QDEV
   WORKER -->|promote_document_to_prod_qdrant| QPROD
@@ -136,10 +136,10 @@ flowchart TB
 | **minio** | official | Source PDF + stage artifacts | 9000 |
 | **qdrant** | official image | DEV search index | 6333 |
 | **qdrant (prod)** | external / env | PROD vectors after Super Admin promote | `PROD_QDRANT_URL` |
-| **sqlite** | volume file | Canonical document/page/chunk/job/audit state | path |
+| **postgres** | official image | Canonical document/workflow/page/chunk/audit state | `DATABASE_URL` |
 | **keycloak** | official | Identity, groups `/states/{ST}/role`, `/global/super-admin` | 8082 |
 
-API and worker share one **SQLite volume** and the same env for providers so
+API and worker share one **Postgres database** and the same env for providers so
 read and write paths stay consistent.
 
 ---
@@ -161,7 +161,7 @@ read and write paths stay consistent.
                 │                             │
 ┌───────────────▼──────────────┐   ┌──────────▼────────────────────────────┐
 │   ORCHESTRATION LAYER        │   │   DOMAIN STATE LAYER                  │
-│   Temporal workflows         │   │   SQLite (SoT for content)            │
+│   Temporal workflows         │   │   Postgres (SoT for content)          │
 │   + review signals           │   │   MinIO (binaries)                    │
 │   + activity retries         │   │   Jobs / audit / index status         │
 └───────────────┬──────────────┘   └───────────────────────────────────────┘
@@ -245,36 +245,36 @@ Supporting workflows: `OcrOnly`, `TranslationOnly`, `ChunkingOnly`,
 
 | Store | System of record for | Not for |
 |---|---|---|
-| **SQLite** | Document stage, pages, chunks, tags, jobs, audit, uploader, `instance` | Binary blobs |
+| **Postgres** | Document stage, workflows, pages, chunks, artifacts, audit, uploader, `instance` | Binary blobs |
 | **MinIO** | PDF originals, exports, payloads | AuthZ decisions |
 | **Temporal DB** | Workflow history & timers | Business content |
 | **Qdrant DEV** | Searchable DEV vectors | Authoritative text |
 | **Qdrant PROD** | Production vectors | Draft/unapproved content |
 
-### 7.2 Key entities (SQLite)
+### 7.2 Key entities (Postgres)
 
 ```text
-documents (workflow_id PK)
+documents (id UUID PK)
   ├── instance              # tenant / state code
-  ├── stage                 # DocumentStage enum
-  ├── uploaded_by_*         # actor provenance
-  ├── page_count / chunk_count
-  ├── latest_job_id
-  ├── reindex_required
-  └── is_disabled / is_demo
+  ├── source (JSONB)        # fingerprint, filename, storage_uri, page_count
+  ├── index_status (JSONB)  # dev / prod vector index state
+  ├── metadata (JSONB)      # chunk_count, reindex_required, is_demo, ...
+  ├── uploaded_by_user_id   # → users
+  └── is_disabled / catalog_entry_id
 
-pages (workflow_id, page_number)
-  └── OCR + translation fields + review flags
+workflows (one per processing run; the latest gives the document's stage)
+  └── workflow_type, status, current_stage, temporal_workflow_id  → Runs UI
 
-chunks (workflow_id, chunk_num)
+workflow_artifacts → files each workflow produced (MinIO)
+
+pages (document_id, page_number)
+  └── OCR text + translations (JSONB) + review flags
+
+chunks (document_id, chunk_number)
   └── text, lineage, exclusion, provenance
-  └── chunk_tags[]
-
-document_jobs
-  └── job_type, status, temporal ids  → Runs UI
 
 audit_logs
-  └── approvals, edits, promote_to_prod
+  └── approvals, edits, promote_to_prod (outlives the document)
 ```
 
 ### 7.3 Tenant rule
@@ -337,7 +337,7 @@ UI always calls API via `/api` proxy — no direct Temporal/MinIO from browser.
 
 | Activity | Purpose | Failure handling |
 |---|---|---|
-| `run_ocr_and_store` | Extract pages → SQLite + MinIO | OCR_RETRY |
+| `run_ocr_and_store` | Extract pages → Postgres + MinIO | OCR_RETRY |
 | `detect_and_translate_pages_from_db` | Lang detect + translate | TRANSLATION_RETRY |
 | `create_chunks_from_db` | Chunk reviewed text | CHUNK_RETRY |
 | `auto_tag_chunks_from_db` | Domain tags | CHUNK_RETRY |
@@ -353,12 +353,12 @@ Providers are **config-driven** (env URLs/models) so OCR/vLLM backends can chang
 
 ```mermaid
 flowchart LR
-  SQLITE[(SQLite chunks)]
+  PGDB[(Postgres chunks)]
   DEV[(DEV index<br/>Qdrant)]
   PROD[(PROD Qdrant)]
 
-  SQLITE -->|approve_ingestion<br/>ingest_document_from_db| DEV
-  SQLITE -->|approve_prod Super Admin<br/>promote_document_to_prod_qdrant| PROD
+  PGDB -->|approve_ingestion<br/>ingest_document_from_db| DEV
+  PGDB -->|approve_prod Super Admin<br/>promote_document_to_prod_qdrant| PROD
   DEV -.->|not automatic| PROD
 ```
 
@@ -399,8 +399,8 @@ Routes: Dashboard, Documents, New Document, Document Ops, Runs, Search, Users (S
 
 ### Runtime properties
 - API + worker: **same image**, different entrypoint  
-- Shared SQLite volume (single-writer lock + WAL)  
-- Horizontal scale: Temporal workers scale out; SQLite remains single-primary (acceptable for ops volume; upgrade path = Postgres if needed)
+- Shared Postgres database (pooled connections per process; schema applied from `migrations/` at startup)  
+- Horizontal scale: Temporal workers and API replicas scale out against the same database
 
 ---
 
@@ -408,7 +408,7 @@ Routes: Dashboard, Documents, New Document, Document Ops, Runs, Search, Users (S
 
 | Concern | Design |
 |---|---|
-| **Consistency** | SQLite SoT; Temporal for execution; search is eventual projection |
+| **Consistency** | Postgres SoT; Temporal for execution; search is eventual projection |
 | **Idempotency** | Workflow ids; reingest overwrites by document id |
 | **Observability** | Runs UI, Temporal UI, audit_logs, stage mirror |
 | **Security** | JWT, least privilege, tenant 404, Super Admin prod gate |
@@ -421,7 +421,7 @@ Routes: Dashboard, Documents, New Document, Document Ops, Runs, Search, Users (S
 ## 15. Threat & trust boundaries
 
 ```text
-[ Browser ] --JWT--> [ API ] --internal net--> [ Worker / Temporal / MinIO / SQLite ]
+[ Browser ] --JWT--> [ API ] --internal net--> [ Worker / Temporal / MinIO / Postgres ]
                            |
                            +--JWKS--> [ Keycloak ]
                            +--HTTP--> [ Qdrant DEV ]
@@ -439,7 +439,7 @@ Routes: Dashboard, Documents, New Document, Document Ops, Runs, Search, Users (S
 | Attribute | Target approach |
 |---|---|
 | Availability | Compose restart policies; Temporal retries |
-| Durability | Workflow history + SQLite + MinIO objects |
+| Durability | Workflow history + Postgres + MinIO objects |
 | Latency | Search interactive; OCR batch (minutes) |
 | Isolation | Per-state `instance` + Keycloak groups |
 | Auditability | append-only audit + Temporal history |
@@ -450,7 +450,7 @@ Routes: Dashboard, Documents, New Document, Document Ops, Runs, Search, Users (S
 ## 17. Evolution / extension points
 
 1. Explicit **“Request PROD approval”** action (today: auto-enter queue after DEV).  
-2. SQLite → Postgres if multi-writer scale is needed.  
+2. Moving `chunk_count` / `is_demo` out of `documents.metadata` into columns if list queries slow down.  
 3. Stricter per-state role on every mutation (not only global permission).  
 4. Automated quality checks before Super Admin sees queue.  
 

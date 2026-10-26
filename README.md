@@ -2,7 +2,7 @@
 
 [![codecov](https://codecov.io/gh/OpenAgriNet/knowledge-provider/graph/badge.svg?token=2TKM2CR2AC)](https://codecov.io/gh/OpenAgriNet/knowledge-provider)
 
-This repository contains a review-driven document ingestion pipeline built around Temporal workflows, FastAPI, SQLite, MinIO, and Qdrant. It is designed for teams that need to normalize heterogeneous files, extract structured text, review and correct outputs, generate chunks, and publish searchable records into a vector index.
+This repository contains a review-driven document ingestion pipeline built around Temporal workflows, FastAPI, Postgres, MinIO, and Qdrant. It is designed for teams that need to normalize heterogeneous files, extract structured text, review and correct outputs, generate chunks, and publish searchable records into a vector index.
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
@@ -63,7 +63,7 @@ The platform is composed of six main services:
          |                      |          |                      |
          v                      v          v                      v
 +--------+---------+   +--------+--+   +---+---------------+   +------------------+
-| MinIO             |   | SQLite    |   | Worker            |   | Lang Detect      |
+| MinIO             |   | Postgres  |   | Worker            |   | Lang Detect      |
 | originals,        |   | canonical |   | normalize, OCR,   |   | language hints   |
 | normalized files, |   | metadata, |   | translate, chunk, |   | before           |
 | artifacts         |   | pages,    |   | ingest            |   | translation      |
@@ -90,7 +90,7 @@ The document has been accepted into the system and assigned a workflow identifie
 
 Typical outputs:
 
-- document row in SQLite
+- document row in Postgres
 - original file reference
 - initial job record
 
@@ -191,16 +191,16 @@ Document-level view of what has been pushed to the vector index.
 
 ## Storage Responsibilities
 
-### SQLite
+### Postgres
 
-SQLite is the canonical metadata and review-state store.
+Postgres is the canonical metadata and review-state store. Its schema is in `migrations/` and described in `docs/POSTGRES_SCHEMA.md`; the api and worker apply pending migrations at startup. Moving an existing SQLite deployment over is a one-off run of `scripts/migrate_sqlite_to_postgres.py` (see the `migrate-sqlite` compose profile).
 
 It owns:
 
 - document rows
+- workflow rows (one per processing run, shown as jobs)
 - page rows
 - chunk rows
-- jobs
 - artifact metadata
 - audit logs
 - search settings
@@ -320,7 +320,7 @@ Default local ports from `docker-compose.yml`:
 
 - Docker and Docker Compose
 - an OCR provider API key exposed as `MISTRAL_API_KEY`
-- enough local disk for SQLite, MinIO artifacts, and Qdrant state
+- enough local disk for Postgres, MinIO artifacts, and Qdrant state
 
 ### Start
 
@@ -355,7 +355,7 @@ Important runtime variables include:
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
 - `MINIO_BUCKET`
-- `DOCUMENT_DB_PATH`
+- `DATABASE_URL`
 - `TRANSLATION_PROVIDER`
 - `TRANSLATION_MODEL`
 - `TRANSLATION_PAGE_CONCURRENCY`

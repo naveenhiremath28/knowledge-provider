@@ -9,7 +9,7 @@ info:
     `pipeline/models.py`, and `pipeline/vector_store/qdrant_store.py`.
 
     Not the full API surface — only `/search` (vector/hybrid semantic search)
-    and `/chunks/search` (SQLite keyword search across chunk records).
+    and `/chunks/search` (keyword search across chunk records).
   version: "1.0.0"
   contact:
     name: knowledge-provider (docs-pipeline)
@@ -73,9 +73,9 @@ paths:
   /chunks/search:
     get:
       operationId: searchChunksAcrossDocuments
-      summary: Keyword search across chunk records (SQLite), for KB maintainer workflows
+      summary: Keyword search across chunk records (Postgres), for KB maintainer workflows
       description: |
-        Distinct from `/search`: this queries chunk rows directly in SQLite by
+        Distinct from `/search`: this queries chunk rows directly in Postgres by
         substring/keyword match, not the vector index. Results are scoped to
         the caller's instance(s) unless the caller is an unrestricted admin.
       tags: [search]
@@ -418,7 +418,7 @@ components:
           type: array
           items:
             type: object
-            description: Raw chunk record from SQLite (db.search_chunks); shape follows the chunks table, not formally typed here.
+            description: Raw chunk record from Postgres (db.search_chunks); shape follows the chunks table, not formally typed here.
             additionalProperties: true
         total:
           type: integer

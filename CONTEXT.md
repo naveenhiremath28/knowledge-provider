@@ -13,7 +13,7 @@ The pipeline stage that runs only after a document's PROD promotion succeeds, an
 _Avoid_: "publish" alone — ambiguous with Publish to Dev.
 
 **Scheme Catalog**:
-The SQLite-backed, scheme-only registry that aggregates one or more documents sharing a `scheme_code`. Backs the pull-based `GET /catalog/v1/*` API that other BAPs poll.
+The scheme-only registry (`catalog_entries` rows plus the computed `catalog` view) that aggregates one or more documents sharing a `scheme_code`. Backs the pull-based `GET /catalog/v1/*` API that other BAPs poll.
 _Avoid_: "catalog" alone — ambiguous with the Network Catalog Envelope.
 
 **Network Catalog Envelope**:
