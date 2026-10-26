@@ -29,8 +29,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Copy pipeline code
+# Copy pipeline code and the SQL migrations the api/worker apply at startup
 COPY pipeline/ ./pipeline/
+COPY migrations/ ./migrations/
+COPY scripts/migrate_sqlite_to_postgres.py ./scripts/migrate_sqlite_to_postgres.py
 
 # Catch imports that work locally but fail on the shipped Python 3.10 image.
 RUN python -c "import pipeline.api"

@@ -20,7 +20,10 @@ class Config:
     temporal_host: str = "localhost:7233"
     minio_endpoint: str = "localhost:9000"
     minio_bucket: str = "documents"
-    document_db_path: str = "/data/documents.db"
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/knowledge_provider"
+    db_pool_min_size: int = 1
+    db_pool_max_size: int = 10
+    db_pool_timeout_seconds: float = 30.0
     translation_provider: str = "gemma_vllm"
     translation_model: str = "google/gemma-4-31b-it"
     translation_vllm_base_url: str = "http://localhost:8020/v1"
@@ -105,7 +108,10 @@ def load_config() -> Config:
         temporal_host=os.environ.get("TEMPORAL_HOST", "localhost:7233"),
         minio_endpoint=os.environ.get("MINIO_ENDPOINT", "localhost:9000"),
         minio_bucket=os.environ.get("MINIO_BUCKET", "documents"),
-        document_db_path=os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db"),
+        database_url=os.environ.get("DATABASE_URL", Config.database_url),
+        db_pool_min_size=int(os.environ.get("DB_POOL_MIN_SIZE", "1")),
+        db_pool_max_size=int(os.environ.get("DB_POOL_MAX_SIZE", "10")),
+        db_pool_timeout_seconds=float(os.environ.get("DB_POOL_TIMEOUT_SECONDS", "30")),
         translation_provider=os.environ.get("TRANSLATION_PROVIDER", "gemma_vllm"),
         translation_model=os.environ.get("TRANSLATION_MODEL", "google/gemma-4-31b-it"),
         translation_vllm_base_url=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),
@@ -158,7 +164,10 @@ def print_config_status():
         ("TEMPORAL_HOST", "localhost:7233"),
         ("MINIO_ENDPOINT", "localhost:9000"),
         ("MINIO_BUCKET", "documents"),
-        ("DOCUMENT_DB_PATH", "/data/documents.db"),
+        ("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/knowledge_provider"),
+        ("DB_POOL_MIN_SIZE", "1"),
+        ("DB_POOL_MAX_SIZE", "10"),
+        ("DB_POOL_TIMEOUT_SECONDS", "30"),
         ("TRANSLATION_PROVIDER", "gemma_vllm"),
         ("TRANSLATION_MODEL", "gemma-4"),
         ("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),

@@ -64,7 +64,11 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 | `LOG_LEVEL` | `INFO` | Worker log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`); the `temporalio` SDK logger stays at `INFO` regardless, to avoid its own noisy debug output |
 | `MINIO_ENDPOINT` | `localhost:9000` | MinIO API host:port |
 | `MINIO_BUCKET` | `documents` | Object storage bucket |
-| `DOCUMENT_DB_PATH` | `/data/documents.db` | SQLite path (use `./data/documents.db` for local non-Docker) |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/knowledge_provider` | Application Postgres (documents, workflows, pages, chunks, audit, settings). The compose `postgres` service builds it from `DB_USERNAME` / `DB_PASSWORD` / `DB_NAME` (defaults `docs` / `docs` / `knowledge_provider`). Pending SQL migrations in `migrations/` are applied by the api and worker at startup |
+| `DB_POOL_MIN_SIZE` | `1` | Connection pool minimum per process |
+| `DB_POOL_MAX_SIZE` | `10` | Connection pool maximum per process (api and worker each hold their own pool) |
+| `DB_POOL_TIMEOUT_SECONDS` | `30` | Seconds to wait for a free pooled connection |
+| `DOCUMENT_DB_PATH` | `/data/documents.db` | Only read by `scripts/migrate_sqlite_to_postgres.py`: the legacy SQLite file to import |
 
 ### API HTTP surface
 
@@ -85,7 +89,7 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 | `WEBHOOK_MAX_RECORDS` | `500` | Max records per `/webhook` request; more returns 413 |
 | `WEBHOOK_API_KEY` | *(empty — required)* | 32-char hex secret. Callers send it in the `x-api-key` header. Missing/invalid header → 401. Unset/empty → 503 (fails closed, ignores `AUTH_DISABLED`). Generate with `openssl rand -hex 16`. |
 
-Body is a JSON array of objects (max `WEBHOOK_MAX_RECORDS`); stored in the SQLite `webhook_records` table, upserted on `(source, external_id)` where `external_id` is `contentID` (else `id`, `slug`, payload hash).
+Body is a JSON array of objects (max `WEBHOOK_MAX_RECORDS`); stored in the `webhook_records` table, upserted on `(source, external_id)` where `external_id` is `contentID` (else `id`, `slug`, payload hash).
 
 ### Auth / Keycloak (backend JWT validation)
 
@@ -259,7 +263,7 @@ First piece of the network-discovery push architecture: once a document's PROD p
 |---------|----|-----|--------|
 | `VITE_*` proxies & Keycloak browser login | ✅ | — | — |
 | JWT validation (`AUTH_*`, `KEYCLOAK_*`) | — | ✅ | — |
-| Temporal / MinIO / SQLite | — | ✅ | ✅ |
+| Temporal / MinIO / Postgres (`DATABASE_URL`) | — | ✅ | ✅ |
 | OCR / translation / chunking / domain tags | — | config / status | ✅ runs jobs |
 | Qdrant (`VECTOR_DB_*`) | — | ✅ | ✅ |
 | Publish to Network (`PUBLISH_TO_NETWORK`, `DISCOVERY_SERVICE_ENDPOINT`, `NETWORK_SENDER_ID`) | — | ✅ `PUBLISH_TO_NETWORK` only (stage list) | ✅ runs the publish activity |
@@ -272,7 +276,7 @@ First piece of the network-discovery push architecture: once a document's PROD p
 
 ```bash
 set -a && source .env && set +a
-export DOCUMENT_DB_PATH="$(pwd)/data/documents.db"
+export DATABASE_URL="postgresql://docs:docs@localhost:5433/knowledge_provider"   # the compose `postgres` service (`docker compose up -d postgres`)
 export ALLOWED_FILE_PATHS="$(pwd)/books,$(pwd)/data/documents"
 export CORS_ORIGINS="http://localhost:3000,http://localhost:3001"
 export PYTHONPATH="$(pwd)"

@@ -19,6 +19,7 @@
 #   API          127.0.0.1:${API_HOST_PORT:-8011}:8001
 #   UI           127.0.0.1:${UI_HOST_PORT:-3011}:80
 #   Keycloak     127.0.0.1:${KEYCLOAK_HOST_PORT:-8081}:8080
+#   Postgres     127.0.0.1:${DB_HOST_PORT:-5433}:5432
 #   Temporal     127.0.0.1:7233:7233
 #   MinIO API    127.0.0.1:9000:9000
 #   MinIO UI     127.0.0.1:9001:9001
@@ -119,6 +120,30 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-documents}
     restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Application database — documents, workflows, pages, chunks, audit, settings.
+  # Schema is applied by api/worker at startup from migrations/ (see
+  # docs/POSTGRES_SCHEMA.md). A deployment that wants its own Postgres can set
+  # DATABASE_URL in .env and drop this service's depends_on entries.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    platform: linux/amd64
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-docs}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-docs}
+      POSTGRES_DB: ${DB_NAME:-knowledge_provider}
+    ports:
+      - "127.0.0.1:${DB_HOST_PORT:-5433}:5432"
+    volumes:
+      - app-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-docs} -d ${DB_NAME:-knowledge_provider}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # Qdrant — DEV vector index (see docs/SYSTEM_DESIGN.md's DEV vs PROD dual
@@ -249,7 +274,7 @@ services:
       TEMPORAL_HOST: temporal:7233
       MINIO_ENDPOINT: minio:9000
       VECTOR_DB_URL: http://qdrant:6333
-      DOCUMENT_DB_PATH: /data/documents.db
+      DATABASE_URL: postgresql://${DB_USERNAME:-docs}:${DB_PASSWORD:-docs}@postgres:5432/${DB_NAME:-knowledge_provider}
       ALLOWED_FILE_PATHS: /app/books,/data/documents
       # HF cache path propagated into the container
       HF_HOME: ${HF_HOME:-/opt/hf-cache}
@@ -257,6 +282,8 @@ services:
     ports:
       - "127.0.0.1:${API_HOST_PORT:-8011}:8001"
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_healthy
       minio:
@@ -268,7 +295,6 @@ services:
     command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
     volumes:
       - ./books:/app/books:ro
-      - sqlite-data:/data
       - documents-data:/data/documents
       - ${HF_HOME:-/opt/hf-cache}:${HF_HOME:-/opt/hf-cache}
     extra_hosts:
@@ -291,11 +317,13 @@ services:
       TEMPORAL_HOST: temporal:7233
       MINIO_ENDPOINT: minio:9000
       VECTOR_DB_URL: http://qdrant:6333
-      DOCUMENT_DB_PATH: /data/documents.db
+      DATABASE_URL: postgresql://${DB_USERNAME:-docs}:${DB_PASSWORD:-docs}@postgres:5432/${DB_NAME:-knowledge_provider}
       ALLOWED_FILE_PATHS: /app/books,/data/documents
       HF_HOME: ${HF_HOME:-/opt/hf-cache}
       HF_HUB_CACHE: ${HF_HOME:-/opt/hf-cache}
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_healthy
       minio:
@@ -307,12 +335,38 @@ services:
     command: python -m pipeline.worker
     volumes:
       - ./books:/app/books:ro
-      - sqlite-data:/data
       - documents-data:/data/documents
       - ${HF_HOME:-/opt/hf-cache}:${HF_HOME:-/opt/hf-cache}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # One-off SQLite -> Postgres data migration (maintenance window, api/worker
+  # stopped). The legacy volume is opened read-only by the script and is never
+  # modified, so rolling back is redeploying the previous images on it.
+  #   docker compose --profile migrate run --rm migrate-sqlite                 # dry run
+  #   MIGRATE_ARGS= docker compose --profile migrate run --rm migrate-sqlite   # real run
+  # ---------------------------------------------------------------------------
+  migrate-sqlite:
+    image: ghcr.io/openagrinet/knowledge-provider:${IMAGE_TAG:-latest}
+    platform: linux/amd64
+    profiles:
+      - migrate
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${DB_USERNAME:-docs}:${DB_PASSWORD:-docs}@postgres:5432/${DB_NAME:-knowledge_provider}
+      DOCUMENT_DB_PATH: /legacy/documents.db
+      DEFAULT_INSTANCE: ${DEFAULT_INSTANCE:-default}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python scripts/migrate_sqlite_to_postgres.py ${MIGRATE_ARGS---dry-run}
+    volumes:
+      - sqlite-data:/legacy
+    restart: "no"
 
   # ---------------------------------------------------------------------------
   # React UI
@@ -349,5 +403,6 @@ volumes:
   keycloak-db-data:
   keycloak-data:
   minio-data:
+  app-db-data:
   sqlite-data:
   documents-data:
