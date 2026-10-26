@@ -4,7 +4,8 @@ set -euo pipefail
 # Backup all persistent data volumes used by the docs pipeline:
 # - Temporal Postgres database
 # - MinIO object storage
-# - SQLite documents/chunks DB
+# - Application Postgres volume (documents, workflows, pages, chunks, audit)
+#   (a logical pg_dump is also written when the postgres container is running)
 #
 # Usage:
 #   ./scripts/backup_volumes.sh                # writes to ./backups
@@ -52,8 +53,18 @@ backup_volume "temporal-db" "temporal-db-data"
 # 2) MinIO object storage (all PDFs / objects)
 backup_volume "minio" "minio-data"
 
-# 3) SQLite documents/chunks DB
-backup_volume "sqlite" "sqlite-data"
+# 3) Application Postgres volume
+backup_volume "app-db" "app-db-data"
+
+# 4) Logical dump of the application database, consistent while the stack runs
+PG_CONTAINER="$(docker ps --format '{{.Names}}' | grep 'postgres' | grep -v 'temporal\|keycloak' | head -n 1 || true)"
+if [[ -n "$PG_CONTAINER" ]]; then
+  echo "Dumping application database from ${PG_CONTAINER}"
+  docker exec "$PG_CONTAINER" sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
+    > "${BACKUP_DIR}/app-db-${TIMESTAMP}.dump"
+else
+  echo "WARNING: application postgres container not running; skipped pg_dump" >&2
+fi
 
 echo
 echo "Backup complete. Files in ${BACKUP_DIR}:"

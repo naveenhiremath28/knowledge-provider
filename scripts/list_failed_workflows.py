@@ -3,7 +3,7 @@
 Query failed workflows and write their IDs and error messages to a file.
 
 This script:
-1. Queries SQLite database for all failed workflows
+1. Queries the Postgres database (DATABASE_URL) for all failed workflows
 2. Extracts workflow_id, filename, and error_message
 3. Optionally queries Temporal for additional error details
 4. Writes results to a CSV file
@@ -12,7 +12,6 @@ This script:
 import asyncio
 import csv
 import os
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -22,8 +21,7 @@ sys.path.insert(0, str(project_root))
 
 from temporalio.client import Client, WorkflowFailureError
 
-# Database path - try environment variable first, then default
-DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
+from pipeline import db
 
 # Configuration
 TEMPORAL_HOST = os.environ.get("TEMPORAL_HOST", "localhost:7233")
@@ -94,37 +92,23 @@ async def get_temporal_error_details(workflow_id: str, client: Client) -> dict:
         }
 
 
-def query_failed_workflows_from_db(db_path: str) -> list:
-    """Query SQLite database directly for failed workflows."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    
-    try:
-        cursor = conn.execute("""
-            SELECT workflow_id, document_id, filename, error_message, created_at
-            FROM documents
-            WHERE stage = 'failed'
-            ORDER BY created_at DESC
-        """)
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+def query_failed_workflows_from_db() -> list:
+    """Query the database for failed workflows (including demo and disabled documents)."""
+    return db.list_documents(
+        stage="failed", limit=1_000_000, include_demo=True, include_disabled=True
+    )
 
 
 async def main():
     """Main function to query failed workflows and write to file."""
-    print(f"Querying failed workflows from SQLite database at {DB_PATH}...")
-    
-    # Check if database exists
-    if not os.path.exists(DB_PATH):
-        print(f"Error: Database not found at {DB_PATH}")
-        print("Make sure you're running this script inside the Docker container or")
-        print("that the database path is correct.")
+    print(f"Querying failed workflows from the database at {db.database_url().rsplit('@', 1)[-1]}...")
+
+    try:
+        failed_docs = query_failed_workflows_from_db()
+    except Exception as e:
+        print(f"Error: could not query the database: {e}")
+        print("Check DATABASE_URL, and run inside the Docker network if the database is not published.")
         sys.exit(1)
-    
-    # Query SQLite for failed workflows
-    failed_docs = query_failed_workflows_from_db(DB_PATH)
     
     print(f"Found {len(failed_docs)} failed workflows")
     
@@ -139,7 +123,7 @@ async def main():
             print("Connected to Temporal")
         except Exception as e:
             print(f"Warning: Could not connect to Temporal: {e}")
-            print("Will only use SQLite error messages")
+            print("Will only use database error messages")
             temporal_client = None
     
     # Process each failed workflow
@@ -154,7 +138,7 @@ async def main():
             "workflow_id": workflow_id,
             "document_id": document_id,
             "filename": filename,
-            "sqlite_error_message": error_message,
+            "db_error_message": error_message,
             "created_at": created_at,
         }
         
@@ -180,7 +164,7 @@ async def main():
             "document_id",
             "filename",
             "created_at",
-            "sqlite_error_message",
+            "db_error_message",
             "temporal_status",
             "temporal_error_message",
             "temporal_error_type",
@@ -196,7 +180,7 @@ async def main():
         print(f"✓ Successfully wrote {len(rows)} failed workflows to {OUTPUT_FILE}")
         print("\nSummary:")
         print(f"  - Total failed workflows: {len(rows)}")
-        print(f"  - With SQLite error messages: {sum(1 for r in rows if r.get('sqlite_error_message'))}")
+        print(f"  - With database error messages: {sum(1 for r in rows if r.get('db_error_message'))}")
         if temporal_client:
             print(f"  - With Temporal error messages: {sum(1 for r in rows if r.get('temporal_error_message'))}")
     else:

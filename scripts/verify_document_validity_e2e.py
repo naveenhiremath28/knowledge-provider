@@ -2,11 +2,12 @@
 End-to-end check of document validity against a live Qdrant.
 
 Run against a local stack:  uv run python scripts/verify_document_validity_e2e.py
-Needs Qdrant on :6333 and the small embedding model cached; it creates and
-deletes its own scratch collection and a throwaway SQLite file, and touches
-neither the real index nor the real db.
+Needs Qdrant on :6333, the small embedding model cached, and a scratch Postgres
+(E2E_DATABASE_URL, migrations are applied to it). It creates and deletes its own
+scratch collection and four documents named wf-*, and touches neither the real
+index nor the real db.
 
-Real path, no stubs on the parts that matter: real SQLite rows, the real
+Real path, no stubs on the parts that matter: real Postgres rows, the real
 _prepare_records + QdrantVectorStore.upsert the ingest activity calls, real
 embeddings, a real Qdrant collection, and the real search filter. Only the
 embedding *model* is swapped for a small cached one so this does not download
@@ -15,15 +16,15 @@ embedding *model* is swapped for a small cached one so this does not download
 
 import os
 import sys
-import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-DB = os.path.join(tempfile.mkdtemp(), "e2e.db")
 COLLECTION = "e2e_validity_check"
 
-os.environ["DOCUMENT_DB_PATH"] = DB
+if not os.environ.get("E2E_DATABASE_URL"):
+    sys.exit("Set E2E_DATABASE_URL to a scratch Postgres database (it is never the real one).")
+os.environ["DATABASE_URL"] = os.environ["E2E_DATABASE_URL"]
 os.environ["AUTH_DISABLED"] = "true"
 os.environ["VECTOR_DB_URL"] = "http://localhost:6333"
 os.environ["VECTOR_DB_COLLECTION_NAME"] = COLLECTION
@@ -39,8 +40,10 @@ from pipeline import db, document_validity  # noqa: E402
 from pipeline.activities import _prepare_records, _validity_fields_from_doc  # noqa: E402
 from pipeline.vector_store.qdrant_store import QdrantVectorStore  # noqa: E402
 
-db.DB_PATH = DB
 db.init_db()
+SCRATCH_DOCUMENTS = ("wf-active", "wf-expired", "wf-future", "wf-legacy")
+for scratch in SCRATCH_DOCUMENTS:
+    db.purge_document(scratch, keep_audit=False)
 
 PASS, FAIL = [], []
 
@@ -232,5 +235,7 @@ store.upsert(COLLECTION, again, batch_size=8)
 check("the shortened period takes it out of today's results", search_docs(), ["wf-legacy"])
 
 store.client.delete_collection(COLLECTION)
+for scratch in SCRATCH_DOCUMENTS:
+    db.purge_document(scratch, keep_audit=False)
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 sys.exit(1 if FAIL else 0)
