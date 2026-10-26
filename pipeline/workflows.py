@@ -96,7 +96,7 @@ async def _mirror_state(
     error_message: Optional[str] = None,
 ) -> dict:
     """
-    Mirror workflow state into SQLite as a local activity.
+    Mirror workflow state into Postgres as a local activity.
 
     Local activities avoid starving tiny state updates behind long-running OCR,
     translation, or chunking activities on the shared task queue.

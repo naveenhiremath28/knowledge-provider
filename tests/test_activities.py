@@ -395,7 +395,7 @@ class TestUpdateDocumentState:
 
     @pytest.mark.unit
     def test_update_state(self, db_connection):
-        """Test updating document state in SQLite."""
+        """Test updating document state in the database."""
         from pipeline.activities import update_document_state
 
         workflow_id = "state-update-test"

@@ -911,7 +911,7 @@ async def run_ocr(filepath: str) -> list[dict]:
 
 @activity.defn
 async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
-    """Run OCR and persist pages to SQLite to avoid large Temporal payloads."""
+    """Run OCR and persist pages to Postgres to avoid large Temporal payloads."""
     from . import db
 
     local_path, cleanup_local = _resolve_local_path(filepath)
@@ -1093,7 +1093,7 @@ async def create_chunks_from_db(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
 ) -> dict:
-    """Create chunks from persisted pages and persist chunks in SQLite."""
+    """Create chunks from persisted pages and persist chunks in Postgres."""
     from . import db
 
     pages = db.get_pages(workflow_id)
@@ -1191,7 +1191,7 @@ async def create_chunks_from_db(
             "stats": result.stats,
         },
     )
-    # Reconcile the document row immediately after chunk persistence so SQLite
+    # Reconcile the document row immediately after chunk persistence so Postgres
     # remains truthful even if the workflow fails before its final state update.
     db.reconcile_materialized_state(workflow_id)
     await _persist_chunking_progress(
@@ -1270,7 +1270,7 @@ async def promote_document_to_prod_qdrant(
     filename: str,
     batch_size: int = 10,
 ) -> dict:
-    """Re-upsert document chunks into the PROD Qdrant collection (from SQLite)."""
+    """Re-upsert document chunks into the PROD Qdrant collection (from Postgres)."""
     from . import db
     from .vector_store.qdrant_store import QdrantVectorStore, get_qdrant_client
 
@@ -1391,7 +1391,7 @@ async def ingest_document_from_db(
     index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
-    """Prepare and ingest chunks directly from SQLite by workflow_id."""
+    """Prepare and ingest chunks directly from Postgres by workflow_id."""
     from . import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
@@ -1541,7 +1541,7 @@ async def update_document_state(
     chunk_count: int = 0,
     error_message: str = None,
 ) -> dict:
-    """Update document state in SQLite."""
+    """Update document state in Postgres."""
     from . import db
 
     activity.logger.info(f"Updating state for {workflow_id}: stage={stage}")
@@ -1578,7 +1578,7 @@ async def update_document_state(
 
 @activity.defn
 async def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]) -> dict:
-    """Persist pages and chunks to SQLite."""
+    """Persist pages and chunks to Postgres."""
     from . import db
 
     activity.logger.info(f"Persisting content for {workflow_id}: {len(pages)} pages, {len(chunks)} chunks")
@@ -1611,7 +1611,7 @@ async def detect_and_translate_pages_from_db(
     target_language: str = "en",
     source_language: str = None,
 ) -> dict:
-    """Detect and translate pages loaded from SQLite; persist updated pages back to SQLite."""
+    """Detect and translate pages loaded from Postgres; persist updated pages back to Postgres."""
     from . import db
 
     pages = db.get_pages(workflow_id)

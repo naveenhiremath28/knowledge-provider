@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentStage(str, Enum):
@@ -180,6 +180,7 @@ class ApprovalRequest(BaseModel):
 
 
 class DocumentSummary(BaseModel):
+    id: Optional[str] = None  # documents.id (UUID); canonical identifier in API paths
     document_id: str
     canonical_document_id: Optional[str] = None
     workflow_id: str  # The Temporal workflow ID (use this for API calls)
@@ -242,9 +243,9 @@ class SchemeMetadataUpdate(BaseModel):
 
 
 class DocumentArtifact(BaseModel):
-    id: int
+    id: str
     workflow_id: str
-    job_id: Optional[int] = None
+    job_id: Optional[str] = None
     artifact_type: str
     stage: Optional[str] = None
     storage_uri: str
@@ -256,7 +257,7 @@ class DocumentArtifact(BaseModel):
 
 
 class DocumentJob(BaseModel):
-    id: int
+    id: str
     workflow_id: str
     job_type: str
     temporal_workflow_id: Optional[str] = None
@@ -293,9 +294,9 @@ class DocumentDetail(DocumentSummary):
     source_type: Optional[str] = None
     canonical_input_type: Optional[str] = None
     stop_after_ocr: bool = False
-    original_artifact_id: Optional[int] = None
-    normalized_artifact_id: Optional[int] = None
-    latest_job_id: Optional[int] = None
+    original_artifact_id: Optional[str] = None
+    normalized_artifact_id: Optional[str] = None
+    latest_job_id: Optional[str] = None
     current_job: Optional[dict[str, Any]] = None
     artifacts: list[DocumentArtifact] = []
     index_status: list[DocumentIndexStatus] = []
@@ -336,7 +337,7 @@ class OperationQueueEntry(BaseModel):
     workflow_id: str
     filename: str
     stage: str
-    job_id: Optional[int] = None
+    job_id: Optional[str] = None
     job_type: Optional[str] = None
     job_status: Optional[str] = None
     started_at: Optional[str] = None
@@ -380,7 +381,7 @@ class ReindexStateRequest(BaseModel):
 
 class AuditLogEntry(BaseModel):
     """A single audit log entry."""
-    id: int
+    id: str
     workflow_id: str
     document_id: str
     action_type: str  # stage_change, page_edit, chunk_edit, approval, page_reset, chunk_reset
@@ -425,7 +426,7 @@ class SearchSettings(BaseModel):
     """Search configuration settings."""
     searchMethod: str = "HYBRID"  # TENSOR, LEXICAL, HYBRID
     limit: int = 12
-    alpha: float = 0.7  # 0=lexical, 1=semantic
+    alpha: float = 0.6  # 0=lexical, 1=semantic
     rankingMethod: str = "rrf"  # rrf, normalize_linear
     showHighlights: bool = True
     efSearch: int = 256
@@ -473,3 +474,118 @@ class SettingsAuditResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# =============================================================================
+# JSONB column models
+#
+# The database only checks that these columns hold a JSON object; the value
+# rules live here. ``db.py`` validates every value through these models before
+# it writes one.
+# =============================================================================
+
+class DocumentSource(BaseModel):
+    """``documents.source``: facts about the uploaded file."""
+    model_config = ConfigDict(extra="forbid")
+
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{32}$")
+    original_filename: Optional[str] = None
+    storage_uri: Optional[str] = None
+    source_type: Optional[str] = None  # spreadsheet | document | unknown
+    canonical_input_type: Optional[str] = None  # spreadsheet | pdf
+    page_count: Optional[int] = Field(default=None, ge=0)
+
+
+class IndexState(BaseModel):
+    """One entry of ``documents.index_status`` (keys ``dev`` / ``prod``)."""
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = "unknown"  # unknown | indexed | missing
+    index_name: Optional[str] = None
+    doc_id: Optional[str] = None
+    chunk_count_indexed: int = Field(default=0, ge=0)
+    last_indexed_at: Optional[str] = None
+    last_verified_at: Optional[str] = None
+    schema_version: Optional[str] = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChunkingRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_number: int = Field(default=1, ge=1)
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+
+
+class DocumentMetadata(BaseModel):
+    """``documents.metadata``: display and flag fields."""
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: Optional[str] = None
+    catalog_visible: bool = True
+    network_visible: bool = True
+    is_demo: bool = False
+    chunk_count: int = Field(default=0, ge=0)
+    reindex_required: bool = False
+    reindex_reason: Optional[str] = None
+    chunking: Optional[ChunkingRun] = None
+
+
+class PageMetadata(BaseModel):
+    """``pages.metadata``: OCR review and language fields."""
+    model_config = ConfigDict(extra="forbid")
+
+    is_reviewed: bool = False
+    reviewer_notes: Optional[str] = None
+    detected_language: Optional[str] = None
+
+
+class PageTranslation(BaseModel):
+    """One language entry of ``pages.translations``."""
+    model_config = ConfigDict(extra="forbid")
+
+    translated_markdown: Optional[str] = None
+    edited_translation: Optional[str] = None
+    is_reviewed: bool = False
+    reviewer_notes: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    translated_at: Optional[str] = None
+
+
+class RetrievalSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    searchMethod: str = Field(default="HYBRID", pattern=r"^(TENSOR|LEXICAL|HYBRID)$")
+    alpha: float = Field(default=0.6, ge=0, le=1)
+    rankingMethod: str = Field(default="rrf", pattern=r"^(rrf|normalize_linear)$")
+    hybridRrfK: int = Field(default=60, ge=1)
+
+
+class CandidateSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    indexName: str = "documents-index"
+    efSearch: int = Field(default=256, ge=1)
+    candidateCap: int = Field(default=120, ge=1)
+    candidateMultiplier: int = Field(default=10, ge=1)
+
+
+class ResultSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(default=12, ge=1)
+    maxChunksPerDoc: int = Field(default=2, ge=1)
+    excludeReference: bool = True
+    showHighlights: bool = True
+    rerankMode: str = "none"
+
+
+class QuerySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    useE5Prefix: bool = True
+    queryExpansionProfile: str = "gu-v1"

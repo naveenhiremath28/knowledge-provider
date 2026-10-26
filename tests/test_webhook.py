@@ -1,7 +1,6 @@
 """Tests for POST /webhook (x-api-key protected)."""
 
 import os
-import uuid
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +29,7 @@ OK_BODY = {"success": True, "message": "Webhook processed successfully.", "recor
 def test_client(db_connection):
     """TestClient without lifespan (no Temporal/MinIO needed for /webhook)."""
     from fastapi.testclient import TestClient
+
     from pipeline import api
 
     return TestClient(api.app)
@@ -87,9 +87,9 @@ class TestWebhookIngest:
         rows = _rows(db_connection)
         assert len(rows) == 1
         assert rows[0]["external_id"] == "101"
-        assert uuid.UUID(rows[0]["id"]).version == 4
+        assert rows[0]["id"].version == 4
         assert rows[0]["category"] == "Agriculture"
-        assert '"popList"' in rows[0]["payload"]
+        assert "popList" in rows[0]["payload"]
 
     def test_repost_is_idempotent(self, test_client, db_connection, key_env):
         test_client.post("/webhook", json=SAMPLE, headers=self.H)

@@ -349,7 +349,7 @@ const STAGE_POLL_INTERVAL_MS = 1500
 const STAGE_POLL_MAX_ATTEMPTS = 40 // ~60s safety net so a stuck workflow doesn't wedge the button forever
 
 function stageWantsPages(stage, pageCount = 0) {
-  // Skip empty registered docs; otherwise pages are local SQLite (fast) and power OCR/translation.
+  // Skip empty registered docs; otherwise pages come from the database (fast) and power OCR/translation.
   if ((stage === 'registered' || stage === 'ocr_processing') && !pageCount) return false
   return true
 }
@@ -544,7 +544,7 @@ export default function DocumentOpsView() {
   /**
    * Progressive load:
    * 1) document shell (unblocks UI immediately)
-   * 2) SQLite pages/chunks needed for the active review surface
+   * 2) Database pages/chunks needed for the active review surface
    * 3) heavy panels (Qdrant / Temporal / audit) only when tab or stage needs them
    */
   const load = useCallback(async ({ soft = false, forcePanels = null } = {}) => {
@@ -581,7 +581,7 @@ export default function DocumentOpsView() {
         attemptedPanelsRef.current.chunks = true
         localTasks.push(loadChunks(wid))
       }
-      // Local SQLite panels in parallel; do not wait on remote index/Temporal for first paint.
+      // Database panels in parallel; do not wait on remote index/Temporal for first paint.
       await Promise.allSettled(localTasks)
       if (requestId !== requestIdRef.current) return
 
@@ -1673,7 +1673,7 @@ export default function DocumentOpsView() {
                       <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Document State</h3>
                       <div className="space-y-2 text-sm">
                         <div className="flex justify-between">
-                          <span className="text-muted-foreground">SQLite Stage</span>
+                          <span className="text-muted-foreground">Database Stage</span>
                           <StageBadge stage={runtime?.sqlite_stage || doc.stage} compact />
                         </div>
                         <div className="flex justify-between">

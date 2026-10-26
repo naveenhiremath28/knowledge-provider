@@ -10,12 +10,12 @@ Tests cover:
 - Error handling
 """
 
+import hashlib
 import os
 
 import pytest
 
 # Set test environment
-os.environ["DOCUMENT_DB_PATH"] = ":memory:"
 os.environ["MINIO_ACCESS_KEY"] = "test-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret"
 os.environ["ALLOWED_FILE_PATHS"] = "/app/books,/tmp"
@@ -101,7 +101,7 @@ class TestDocumentEndpoints:
     @pytest.mark.api
     @pytest.mark.unit
     def test_get_document_from_db(self, test_client, db_connection):
-        """Test getting document details from SQLite fallback."""
+        """Test getting document details from the database."""
         workflow_id = "get-test-001"
         db_connection.upsert_document(
             workflow_id=workflow_id,
@@ -122,6 +122,144 @@ class TestDocumentEndpoints:
         """Test 404 for non-existent document."""
         response = test_client.get("/documents/nonexistent-workflow")
         assert response.status_code == 404
+
+
+class TestDocumentIdentifiers:
+    """`/documents/{id}` takes the UUID (canonical) or any legacy identifier."""
+
+    FINGERPRINT = hashlib.md5(b"identifiers").hexdigest()
+    WORKFLOW_ID = f"doc-{FINGERPRINT}"
+
+    def _document(self, db_connection):
+        db_connection.upsert_document(
+            workflow_id=self.WORKFLOW_ID,
+            document_id=self.FINGERPRINT,
+            filename="identifiers.pdf",
+            filepath="minio://documents/identifiers.pdf",
+            stage="ocr_review",
+        )
+        db_connection.save_pages(
+            self.WORKFLOW_ID, [{"page_number": 1, "original_markdown": "page one"}]
+        )
+        return db_connection.get_document(self.WORKFLOW_ID)
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_the_response_carries_the_uuid_and_the_temporal_id(self, test_client, db_connection):
+        doc = self._document(db_connection)
+        body = test_client.get(f"/documents/{doc['id']}").json()
+        assert body["id"] == doc["id"]
+        assert body["workflow_id"] == self.WORKFLOW_ID
+        assert body["document_id"] == self.FINGERPRINT
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    @pytest.mark.parametrize("form", ["uuid", "workflow", "fingerprint", "filename"])
+    def test_every_identifier_form_reaches_the_same_document(self, test_client, db_connection, form):
+        doc = self._document(db_connection)
+        identifier = {
+            "uuid": doc["id"],
+            "workflow": self.WORKFLOW_ID,
+            "fingerprint": self.FINGERPRINT,
+            "filename": "identifiers.pdf",
+        }[form]
+        detail = test_client.get(f"/documents/{identifier}")
+        pages = test_client.get(f"/documents/{identifier}/pages")
+        assert detail.status_code == 200 and pages.status_code == 200
+        assert detail.json()["id"] == doc["id"]
+        assert [p["page_number"] for p in pages.json()] == [1]
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_the_uuid_is_rewritten_to_the_temporal_id_before_handlers_run(
+        self, test_client, db_connection, mock_temporal_client
+    ):
+        doc = self._document(db_connection)
+        db_connection.update_document_stage(doc["id"], "approval_for_prod")
+        response = test_client.post(f"/documents/{doc['id']}/approve-prod")
+        assert response.status_code == 200
+        queried = [call.args[0] for call in mock_temporal_client.get_workflow_handle.call_args_list]
+        assert queried and set(queried) == {self.WORKFLOW_ID}
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_static_document_routes_are_not_mistaken_for_identifiers(self, test_client, db_connection):
+        db_connection.upsert_document(
+            workflow_id="summary", document_id=hashlib.md5(b"summary").hexdigest(),
+            filename="summary", filepath="/tmp/s.pdf",
+        )
+        response = test_client.get("/documents/summary")
+        assert response.status_code == 200
+        assert "total_documents" in response.json()
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_an_unknown_identifier_is_404(self, test_client, db_connection):
+        assert test_client.get("/documents/00000000-0000-0000-0000-000000000000").status_code == 404
+
+
+class TestArtifactAndJobIdentifiers:
+    """Artifact and job ids are UUIDs."""
+
+    def _document(self, db_connection):
+        db_connection.upsert_document(
+            workflow_id="wf-art-api", document_id=hashlib.md5(b"art").hexdigest(),
+            filename="a.pdf", filepath="minio://documents/a.pdf", stage="ocr_review",
+        )
+        artifact_id = db_connection.add_document_artifact(
+            "wf-art-api", "original_upload", "minio://documents/a.pdf", stage="registered",
+            filename="a.pdf",
+        )
+        return artifact_id
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_artifacts_are_addressed_by_uuid(self, test_client, db_connection):
+        artifact_id = self._document(db_connection)
+        listed = test_client.get("/documents/wf-art-api/artifacts").json()
+        assert [a["id"] for a in listed] == [artifact_id]
+        assert test_client.get(f"/documents/wf-art-api/artifacts/{artifact_id}").json()["id"] == artifact_id
+        assert test_client.get("/documents/wf-art-api/artifacts/7").status_code == 404
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_document_detail_derives_artifact_and_job_pointers(self, test_client, db_connection):
+        artifact_id = self._document(db_connection)
+        body = test_client.get("/documents/wf-art-api").json()
+        job = db_connection.get_latest_document_job("wf-art-api")
+        assert body["original_artifact_id"] == artifact_id
+        assert body["normalized_artifact_id"] is None
+        assert body["latest_job_id"] == job["id"]
+        assert body["artifacts"][0]["job_id"] == job["id"]
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_runs_are_addressed_by_uuid(self, test_client, db_connection):
+        self._document(db_connection)
+        job = db_connection.get_latest_document_job("wf-art-api")
+        assert test_client.get(f"/runs/{job['id']}").json()["id"] == job["id"]
+        assert test_client.get("/runs/3").status_code == 404
+        assert [r["id"] for r in test_client.get("/runs").json()] == [job["id"]]
+
+
+class TestHealthAndSettings:
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_health_reports_the_database(self, test_client):
+        body = test_client.get("/health").json()
+        assert body["database"] == {"reachable": True, "migrations_current": True}
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_settings_default_alpha_and_validation(self, test_client):
+        assert test_client.get("/settings/search").json()["alpha"] == 0.6
+        assert test_client.put("/settings/search", json={"alpha": 2}).status_code == 400
+        updated = test_client.put("/settings/search", json={"limit": 7}).json()
+        assert updated["limit"] == 7
+        reset = test_client.post("/settings/search/reset").json()
+        assert reset["limit"] == 12 and reset["alpha"] == 0.6
+        audit = test_client.get("/settings/search/audit").json()
+        assert audit["total"] == 2 and audit["logs"][0]["document_id"] == "__settings__"
 
 
 class TestProdApproval:

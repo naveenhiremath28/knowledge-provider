@@ -1,7 +1,7 @@
 """Unit tests for DocumentRepository.
 
 Two styles on purpose: the `db_connection` fixture exercises the repository
-against real SQLite (so a drifted db.py signature fails here), and the fake-db
+against real the database (so a drifted db.py signature fails here), and the fake-db
 tests pin the None guards that are the repository's own behaviour.
 """
 

@@ -59,8 +59,8 @@ async def main():
             print("Error: TRANSLATION_VLLM_BASE_URL not set")
             return
 
-    # Initialize SQLite database
-    print("Initializing SQLite database...")
+    # Initialize Postgres database
+    print("Initializing database...")
     db.init_db()
 
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")

@@ -2,7 +2,8 @@
 Pytest configuration and fixtures for the document ingestion pipeline.
 
 Provides fixtures for:
-- SQLite database (in-memory for isolation)
+- Postgres database (a throwaway container, or the server named by
+  TEST_DATABASE_URL; migrations applied once, tables truncated per test)
 - FastAPI TestClient
 - Mock Temporal client
 - Mock MinIO client
@@ -15,31 +16,58 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 # Set test environment before imports
-os.environ["DOCUMENT_DB_PATH"] = ":memory:"
 os.environ["MINIO_ACCESS_KEY"] = "test-access-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret-key"
 os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
 os.environ["AUTH_DISABLED"] = "true"
 
 
-@pytest.fixture(scope="function")
-def temp_db_path(tmp_path):
-    """Create a temporary database path for each test."""
-    db_path = tmp_path / "test.db"
-    os.environ["DOCUMENT_DB_PATH"] = str(db_path)
-    yield str(db_path)
-    # Cleanup happens automatically with tmp_path
+_TRUNCATE_SQL = """
+    TRUNCATE documents, users, catalog_entries, audit_logs, email_otps,
+             webhook_records, search_settings CASCADE
+"""
 
 
-@pytest.fixture(scope="function")
-def db_connection(temp_db_path):
-    """Initialize database and provide connection for testing."""
+@pytest.fixture(scope="session")
+def postgres_url():
+    """URL of the Postgres the tests run against, with migrations applied.
+
+    Every table is truncated before each test, so TEST_DATABASE_URL must name a
+    scratch database, never a real one.
+    """
+    url = os.environ.get("TEST_DATABASE_URL")
+    container = None
+    if not url:
+        from testcontainers.postgres import PostgresContainer
+
+        container = PostgresContainer("postgres:15-alpine", driver=None)
+        container.start()
+        url = container.get_connection_url()
+    os.environ["DATABASE_URL"] = url
     from pipeline import db
-    db.DB_PATH = temp_db_path
+
+    db.close_pool()
     db.init_db()
+    yield url
+    db.close_pool()
+    if container is not None:
+        container.stop()
+
+
+@pytest.fixture(scope="function")
+def db_connection(postgres_url):
+    """The db module on an empty database (seed rows restored after each truncate)."""
+    from pipeline import db
+
+    os.environ["DATABASE_URL"] = postgres_url
+    with db.get_connection() as conn:
+        conn.execute(_TRUNCATE_SQL)
+        conn.execute(
+            "INSERT INTO users (keycloak_user_id, username, roles) "
+            "VALUES ('local-admin', 'local-admin', '{superadmin}')"
+        )
+        conn.execute("INSERT INTO search_settings DEFAULT VALUES")
     yield db
-    # Reset for next test
-    db.DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
 
 @pytest.fixture
@@ -78,7 +106,7 @@ def mock_minio_client():
 
 
 @pytest.fixture
-def test_client(mock_temporal_client, mock_minio_client):
+def test_client(db_connection, mock_temporal_client, mock_minio_client):
     """Create FastAPI TestClient with mocked dependencies.
 
     Neutralizes the app's real lifespan (which otherwise connects to a live
@@ -94,9 +122,6 @@ def test_client(mock_temporal_client, mock_minio_client):
     # Patch the global clients
     api.temporal_client = mock_temporal_client
     api.minio_client = mock_minio_client
-
-    # Initialize database
-    api.db.init_db()
 
     @asynccontextmanager
     async def _noop_lifespan(_app):

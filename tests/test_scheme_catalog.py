@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-import json
-import os
-
 import pytest
 
 
 @pytest.fixture
-def catalog_db(temp_db_path):
-    from pipeline import db, scheme_catalog
+def catalog_db(db_connection):
+    from pipeline import scheme_catalog
 
-    db.DB_PATH = temp_db_path
-    db.init_db()
-    scheme_catalog.ensure_catalog_schema()
-    yield db, scheme_catalog
-    db.DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
+    yield db_connection, scheme_catalog
 
 
 def test_bootstrap_seeds_13_vector_schemes(catalog_db):
@@ -72,8 +65,7 @@ def test_scheme_metadata_and_promote_rebuild(catalog_db):
     assert entry is not None
     assert entry["status"] == "live"
     assert entry["source"] == "pipeline"
-    aliases = json.loads(entry["scheme_aliases_json"])
-    assert "organic" in aliases or "PKVY" in aliases
+    assert "organic" in entry["aliases"] or "PKVY" in entry["aliases"]
 
 
 def test_code_rename_pending_reindex(catalog_db):
@@ -237,19 +229,16 @@ def test_prepare_records_document_unchanged():
 
 
 @pytest.fixture
-def asgi_client(temp_db_path, mock_temporal_client, mock_minio_client):
+def asgi_client(db_connection, mock_temporal_client, mock_minio_client):
     """HTTP client that does not run real Temporal/MinIO lifespan."""
     from contextlib import asynccontextmanager
 
     from fastapi.testclient import TestClient
 
-    from pipeline import api, db, scheme_catalog
+    from pipeline import api
 
-    db.DB_PATH = temp_db_path
-    db.init_db()
     api.temporal_client = mock_temporal_client
     api.minio_client = mock_minio_client
-    scheme_catalog.ensure_catalog_schema()
 
     @asynccontextmanager
     async def _noop_lifespan(_app):
@@ -262,7 +251,6 @@ def asgi_client(temp_db_path, mock_temporal_client, mock_minio_client):
             yield client
     finally:
         api.app.router.lifespan_context = original
-        db.DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
 
 def test_catalog_api_snapshot(asgi_client):

@@ -95,7 +95,7 @@ def test_find_document_by_legacy_doc_id_hash(db_connection):
 def test_provenance_chunk_endpoint(db_connection):
     db = db_connection
     workflow_id = "doc-provenance01"
-    document_id = "prov-doc-id-xyz"
+    document_id = hashlib.md5(b"prov-doc-id-xyz").hexdigest()
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,

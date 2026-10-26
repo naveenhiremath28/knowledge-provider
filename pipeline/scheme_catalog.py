@@ -370,54 +370,26 @@ def resolve_scheme_aliases(
     return _dedupe_aliases(merged)
 
 
-def _content_hash(code: str, name: str, aliases: list[str], network_visible: bool, status: str) -> str:
-    payload = json.dumps(
-        {
-            "code": code,
-            "name": name,
-            "aliases": sorted(aliases),
-            "network_visible": network_visible,
-            "status": status,
-        },
-        sort_keys=True,
+def _seed_bootstrap_entry(code: str, definition: dict[str, Any]) -> None:
+    db.upsert_catalog_entry(
+        type="scheme",
+        code=code,
+        name=definition["scheme_name"],
+        aliases=list(definition.get("scheme_aliases") or []),
+        source="bootstrap",
     )
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-def ensure_catalog_schema() -> None:
-    """Create catalog tables and scheme metadata columns (idempotent)."""
-    db.init_scheme_catalog_schema()
 
 
 def bootstrap_catalog_if_empty(*, force: bool = False) -> dict[str, Any]:
-    """Seed bootstrap vector + legacy schemes when catalog is empty (or force)."""
-    ensure_catalog_schema()
-    meta = db.get_catalog_meta()
-    entries = db.list_catalog_entries()
-    if entries and not force:
-        return {"bootstrapped": False, "version": meta.get("version", 0), "entry_count": len(entries)}
+    """Seed bootstrap vector schemes that have no catalog entry yet (all of them if force)."""
+    existing = db.list_catalog_entry_codes("scheme")
+    missing = {c: d for c, d in BOOTSTRAP_VECTOR_SCHEMES.items() if force or c not in existing}
+    if not missing:
+        meta = db.get_catalog_meta()
+        return {"bootstrapped": False, "version": meta.get("version", 0), "entry_count": len(existing)}
 
-    now = utc_now_iso()
-    collection = scheme_collection_name()
-    for code, definition in BOOTSTRAP_VECTOR_SCHEMES.items():
-        aliases = list(definition.get("scheme_aliases") or [])
-        name = definition["scheme_name"]
-        status = "live"
-        db.upsert_catalog_entry(
-            scheme_code=code,
-            scheme_name=name,
-            scheme_aliases=aliases,
-            instances=["default"],
-            workflow_ids=[],
-            collection_name=collection,
-            chunk_count=0,
-            status=status,
-            network_visible=True,
-            promoted_at=None,
-            content_hash=_content_hash(code, name, aliases, True, status),
-            source="bootstrap",
-            updated_at=now,
-        )
+    for code, definition in missing.items():
+        _seed_bootstrap_entry(code, definition)
     version = db.bump_catalog_version("bootstrap_vector_schemes")
     return {
         "bootstrapped": True,
@@ -429,182 +401,16 @@ def bootstrap_catalog_if_empty(*, force: bool = False) -> dict[str, Any]:
 
 def rebuild_catalog_from_documents(*, reason: str = "rebuild") -> int:
     """
-    Recompute scheme_catalog_entries from documents table, then bump version.
+    Re-seed bootstrap codes that have no entry, then bump the catalog version.
 
-    Pipeline-sourced live docs override bootstrap for the same scheme_code.
-    Bootstrap-only codes with no live docs remain live (migration phase A1).
+    Status, instances, chunk counts and the rest are computed by the ``catalog``
+    view, so there is nothing to recompute here. Bootstrap-only codes with no
+    documents stay live.
     """
-    ensure_catalog_schema()
-    now = utc_now_iso()
-    collection = scheme_collection_name()
-
-    docs = db.list_scheme_documents_for_catalog()
-    by_code: dict[str, list[dict]] = {}
-    for doc in docs:
-        code = (doc.get("scheme_code") or "").strip().lower()
-        if not code:
-            continue
-        by_code.setdefault(code, []).append(doc)
-
-    # Track which codes are fully owned by pipeline live docs
-    live_pipeline_codes: set[str] = set()
-
-    for code, group in by_code.items():
-        live_docs = [
-            d
-            for d in group
-            if (d.get("stage") == "completed")
-            and not int(d.get("is_disabled") or 0)
-            and int(d.get("catalog_visible") if d.get("catalog_visible") is not None else 1)
-            and (d.get("document_kind") or "document") == "scheme"
-        ]
-        pending_reindex = any(
-            (d.get("stage") == "completed")
-            and not int(d.get("is_disabled") or 0)
-            and (d.get("reindex_required") or d.get("_pending_reindex"))
-            for d in group
-        )
-        # Also treat reindex_reason containing scheme_code_rename as pending_reindex
-        for d in group:
-            reason_txt = (d.get("reindex_reason") or "")
-            if "scheme_code_rename" in reason_txt and d.get("stage") == "completed" and not int(d.get("is_disabled") or 0):
-                pending_reindex = True
-
-        if pending_reindex and live_docs:
-            # If any live doc is waiting reindex after rename, publish as pending_reindex
-            # unless we only have non-rename live docs — keep simple: any reindex_required on scheme
-            if any(int(d.get("reindex_required") or 0) for d in live_docs):
-                status = "pending_reindex"
-            else:
-                status = "live"
-        elif live_docs:
-            status = "live"
-            live_pipeline_codes.add(code)
-        elif any(d.get("stage") == "approval_for_prod" and not int(d.get("is_disabled") or 0) for d in group):
-            status = "pending_prod"
-        else:
-            status = "disabled"
-
-        # Prefer live docs for aggregation; else all group
-        use = live_docs or group
-        names = [d.get("scheme_name") for d in use if d.get("scheme_name")]
-        scheme_name = names[0] if names else code
-        aliases: list[str] = []
-        seen_alias: set[str] = set()
-        for d in use:
-            for a in parse_aliases(d.get("scheme_aliases_json")):
-                key = a.lower()
-                if key not in seen_alias:
-                    seen_alias.add(key)
-                    aliases.append(a)
-        instances = sorted(
-            {
-                (d.get("instance") or "default").strip().lower() or "default"
-                for d in use
-            }
-        )
-        workflow_ids = [d["workflow_id"] for d in use if d.get("workflow_id")]
-        chunk_count = sum(int(d.get("chunk_count") or 0) for d in use)
-        network_visible = any(int(d.get("network_visible") or 0) for d in use)  # OR
-        promoted_times = [d.get("ingested_at") or d.get("updated_at") for d in live_docs if d.get("ingested_at") or d.get("updated_at")]
-        promoted_at = max(promoted_times) if promoted_times else None
-        source = "pipeline" if any((d.get("document_kind") or "") == "scheme" for d in group) else "import"
-
-        # pending_reindex entries must not appear as live for consumers
-        if status == "pending_reindex":
-            # still store entry but status excludes from vector_schemes
-            pass
-
-        db.upsert_catalog_entry(
-            scheme_code=code,
-            scheme_name=scheme_name,
-            scheme_aliases=aliases,
-            instances=instances,
-            workflow_ids=workflow_ids,
-            collection_name=collection,
-            chunk_count=chunk_count,
-            status=status if status != "disabled" or live_docs else "disabled",
-            network_visible=1 if network_visible else 0,
-            promoted_at=promoted_at,
-            content_hash=_content_hash(code, scheme_name, aliases, network_visible, status),
-            source=source,
-            updated_at=now,
-        )
-
-    # Preserve bootstrap live entries for codes with no document rows;
-    # disable orphan pipeline / import codes that have no docs left.
-    existing = {e["scheme_code"]: e for e in db.list_catalog_entries()}
+    existing = db.list_catalog_entry_codes("scheme")
     for code, definition in BOOTSTRAP_VECTOR_SCHEMES.items():
-        if code in by_code:
-            continue
-        if code in existing and existing[code].get("source") == "pipeline":
-            # Was pipeline-owned but no longer eligible → mark disabled
-            if code not in live_pipeline_codes:
-                db.upsert_catalog_entry(
-                    scheme_code=code,
-                    scheme_name=existing[code].get("scheme_name") or definition["scheme_name"],
-                    scheme_aliases=parse_aliases(existing[code].get("scheme_aliases_json")),
-                    instances=parse_aliases(existing[code].get("instances_json")) or ["default"],
-                    workflow_ids=parse_aliases(existing[code].get("workflow_ids_json")),
-                    collection_name=collection,
-                    chunk_count=int(existing[code].get("chunk_count") or 0),
-                    status="disabled",
-                    network_visible=int(existing[code].get("network_visible") or 0),
-                    promoted_at=existing[code].get("promoted_at"),
-                    content_hash=_content_hash(
-                        code,
-                        existing[code].get("scheme_name") or definition["scheme_name"],
-                        parse_aliases(existing[code].get("scheme_aliases_json")),
-                        bool(existing[code].get("network_visible")),
-                        "disabled",
-                    ),
-                    source="pipeline",
-                    updated_at=now,
-                )
-            continue
-        # Keep or re-seed bootstrap
-        aliases = list(definition.get("scheme_aliases") or [])
-        name = definition["scheme_name"]
-        db.upsert_catalog_entry(
-            scheme_code=code,
-            scheme_name=name,
-            scheme_aliases=aliases,
-            instances=["default"],
-            workflow_ids=[],
-            collection_name=collection,
-            chunk_count=0,
-            status="live",
-            network_visible=1,
-            promoted_at=None,
-            content_hash=_content_hash(code, name, aliases, True, "live"),
-            source="bootstrap",
-            updated_at=now,
-        )
-
-    # Disable non-bootstrap entries that no longer appear in any document group
-    for code, entry in existing.items():
-        if code in by_code or code in BOOTSTRAP_VECTOR_SCHEMES:
-            continue
-        if (entry.get("status") or "") == "disabled":
-            continue
-        name = entry.get("scheme_name") or code
-        aliases = parse_aliases(entry.get("scheme_aliases_json"))
-        db.upsert_catalog_entry(
-            scheme_code=code,
-            scheme_name=name,
-            scheme_aliases=aliases,
-            instances=parse_aliases(entry.get("instances_json")) or ["default"],
-            workflow_ids=[],
-            collection_name=collection,
-            chunk_count=int(entry.get("chunk_count") or 0),
-            status="disabled",
-            network_visible=int(entry.get("network_visible") or 0),
-            promoted_at=entry.get("promoted_at"),
-            content_hash=_content_hash(code, name, aliases, bool(entry.get("network_visible")), "disabled"),
-            source=entry.get("source") or "pipeline",
-            updated_at=now,
-        )
-
+        if code not in existing:
+            _seed_bootstrap_entry(code, definition)
     return db.bump_catalog_version(reason)
 
 
@@ -667,7 +473,6 @@ def build_snapshot(
     include_pending: bool = False,
     network_visible: Optional[bool] = None,
 ) -> dict[str, Any]:
-    ensure_catalog_schema()
     meta = db.get_catalog_meta()
     version = int(meta.get("version") or 0)
     updated_at = meta.get("updated_at") or utc_now_iso()
@@ -685,27 +490,25 @@ def build_snapshot(
         # Live snapshot for warmers: only status=live (pending excluded unless include_pending)
         if not include_pending and st != "live":
             continue
-        instances = parse_aliases(e.get("instances_json"))
+        instances = e["instances"]
         if instance:
             inst = instance.strip().lower()
             if inst not in {i.lower() for i in instances} and instances:
-                # bootstrap may have ["default"] only
-                if inst not in {i.lower() for i in instances}:
-                    continue
-        nv = bool(int(e.get("network_visible") or 0))
+                continue
+        nv = bool(e.get("network_visible"))
         if network_visible is not None and nv != network_visible:
             continue
         vector_schemes.append(
             {
-                "scheme_code": e["scheme_code"],
-                "scheme_name": e.get("scheme_name") or e["scheme_code"],
-                "scheme_aliases": parse_aliases(e.get("scheme_aliases_json")),
+                "scheme_code": e["code"],
+                "scheme_name": e.get("name") or e["code"],
+                "scheme_aliases": e["aliases"],
                 "tool": "search_schemes",
                 "tool_routing": "qdrant",
                 "instances": instances or ["default"],
                 "network_visible": nv,
                 "chunk_count": int(e.get("chunk_count") or 0),
-                "workflow_ids": parse_aliases(e.get("workflow_ids_json")),
+                "workflow_ids": e["workflow_ids"],
                 "promoted_at": e.get("promoted_at"),
                 "source": e.get("source") or "bootstrap",
                 "status": st,
@@ -765,7 +568,6 @@ def apply_scheme_metadata(
     document has none - so a reviewer who only moves the end date does not have
     to restate the start.
     """
-    ensure_catalog_schema()
     doc = db.get_document(workflow_id)
     if not doc:
         raise LookupError(f"Document not found: {workflow_id}")
