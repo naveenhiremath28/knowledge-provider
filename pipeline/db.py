@@ -586,11 +586,20 @@ def get_unindexed_webhook_record_ids(
         return [str(r["id"]) for r in conn.execute(sql + " ORDER BY created_at, id", params)]
 
 
-def get_webhook_record_ids(source: str = "webhook", published_only: bool = False) -> list[str]:
-    """All record ids for a source, optionally only published ones."""
+def get_webhook_record_ids(
+    source: str = "webhook", published_only: bool = False, indexed_only: bool = False
+) -> list[str]:
+    """All record ids for a source, optionally only published and/or dev-indexed ones.
+
+    ``indexed_only`` keeps rows whose current payload is what was last written to the dev
+    collection (``indexed_hash = payload_hash``), so a bulk promote never pushes a payload
+    that has not been indexed in dev.
+    """
     sql = "SELECT id FROM webhook_records WHERE source = %s"
     if published_only:
         sql += " AND is_published AND status = 'Published'"
+    if indexed_only:
+        sql += " AND indexed_hash = payload_hash"
     with get_connection() as conn:
         return [str(r["id"]) for r in conn.execute(sql + " ORDER BY created_at, id", (source,))]
 

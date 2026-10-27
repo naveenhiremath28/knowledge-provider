@@ -4165,12 +4165,12 @@ async def advisory_reindex(body: AdvisoryReindexBody, user: RequireAdmin):
 
 @app.post("/webhook/advisory/promote")
 async def advisory_promote(body: AdvisoryPromoteBody, user: RequireAdmin):
-    """Queue promotion to the PROD collection: given record ids, else all published records."""
+    """Queue promotion to the PROD collection: given record ids, else all published records already indexed in dev."""
     client = _require_temporal()
     if body.record_ids is not None:
         record_ids = body.record_ids
     else:
-        record_ids = db.get_webhook_record_ids(published_only=True)
+        record_ids = db.get_webhook_record_ids(published_only=True, indexed_only=True)
     queued = await start_advisory_promote(client, record_ids)
     return {"success": True, "queued": queued}
 

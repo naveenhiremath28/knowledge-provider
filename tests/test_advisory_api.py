@@ -128,12 +128,22 @@ class TestAdminEndpoints:
         assert r.json()["queued"] == 1
         assert _started(temporal) == [f"advisory-{rid}"]
 
-    def test_promote_defaults_to_published_records(self, client, db_connection, temporal):
+    def test_promote_defaults_to_published_records_indexed_in_dev(self, client, db_connection, temporal):
         self._seed(client, temporal, _rec(1), _rec(2, published=0, status="Draft"))
+        ids = _row_ids(db_connection, 1, 2)
+        for rid in ids.values():
+            db_connection.mark_webhook_record_indexed(rid, db_connection.get_webhook_record(rid)["payload_hash"])
+        temporal.start_workflow.reset_mock()
         r = client.post("/webhook/advisory/promote", json={})
         assert r.json() == {"success": True, "queued": 1}
-        published = _row_ids(db_connection, 1)[1]
-        assert _started(temporal) == [f"advisory-promote-{published}"]
+        assert _started(temporal) == [f"advisory-promote-{ids[1]}"]
+
+    def test_default_promote_skips_records_not_indexed_in_dev(self, client, db_connection, temporal):
+        self._seed(client, temporal, _rec(1))
+        temporal.start_workflow.reset_mock()
+        r = client.post("/webhook/advisory/promote", json={})
+        assert r.json() == {"success": True, "queued": 0}
+        assert _started(temporal) == []
 
     def test_promote_explicit_ids(self, client, db_connection, temporal):
         self._seed(client, temporal, _rec(1), _rec(2))
