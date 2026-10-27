@@ -16,17 +16,22 @@ from .activities import (
     create_chunks_from_db,
     detect_and_translate_pages,
     detect_and_translate_pages_from_db,
+    index_webhook_advisory,
     ingest_document_from_db,
     ingest_to_vector_db,
     persist_document_content,
     prepare_for_ingestion,
     promote_document_to_prod_qdrant,
+    promote_webhook_advisory,
     publish_catalog_to_network,
     run_ocr,
     run_ocr_and_store,
     update_document_state,
 )
+from .advisory_start import backfill_on_start
 from .workflows import (
+    AdvisoryIndexWorkflow,
+    AdvisoryPromoteWorkflow,
     ChunkingOnlyWorkflow,
     DocumentPipelineWorkflow,
     OcrOnlyWorkflow,
@@ -81,6 +86,8 @@ async def main():
             TranslationOnlyWorkflow,
             OcrOnlyWorkflow,
             ChunkingOnlyWorkflow,
+            AdvisoryIndexWorkflow,
+            AdvisoryPromoteWorkflow,
         ],
         activities=[
             run_ocr,
@@ -92,6 +99,8 @@ async def main():
             ingest_to_vector_db,
             ingest_document_from_db,
             promote_document_to_prod_qdrant,
+            index_webhook_advisory,
+            promote_webhook_advisory,
             publish_catalog_to_network,
             update_document_state,
             detect_and_translate_pages,
@@ -99,6 +108,10 @@ async def main():
             persist_document_content,
         ],
     )
+
+    backfilled = await backfill_on_start(client)
+    if backfilled:
+        print(f"Advisory startup backfill queued {backfilled} workflows")
 
     print(f"Worker started on queue: {TASK_QUEUE}")
     print("Waiting for workflows...")

@@ -1230,14 +1230,14 @@ class TestMigrationRunner:
         from pipeline import migrate
 
         (tmp_path / "0001_initial_schema.sql").write_text("SELECT 1;")
-        (tmp_path / "0002_probe.sql").write_text("CREATE TABLE mig_probe (n int);")
+        (tmp_path / "0099_probe.sql").write_text("CREATE TABLE mig_probe (n int);")
         try:
-            assert migrate.apply_migrations(postgres_url, tmp_path) == ["0002"]
+            assert migrate.apply_migrations(postgres_url, tmp_path) == ["0099"]
             assert migrate.apply_migrations(postgres_url, tmp_path) == []
         finally:
             with db_connection.get_connection() as conn:
                 conn.execute("DROP TABLE IF EXISTS mig_probe")
-                conn.execute("DELETE FROM schema_migrations WHERE version = '0002'")
+                conn.execute("DELETE FROM schema_migrations WHERE version = '0099'")
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -1245,13 +1245,13 @@ class TestMigrationRunner:
         from pipeline import migrate
 
         (tmp_path / "0001_initial_schema.sql").write_text("SELECT 1;")
-        (tmp_path / "0002_bad.sql").write_text("CREATE TABLE mig_half (n int); SELECT 1/0;")
+        (tmp_path / "0099_bad.sql").write_text("CREATE TABLE mig_half (n int); SELECT 1/0;")
         with pytest.raises(psycopg.errors.DivisionByZero):
             migrate.apply_migrations(postgres_url, tmp_path)
         with db_connection.get_connection() as conn:
             assert conn.execute("SELECT to_regclass('mig_half') AS t").fetchone()["t"] is None
             assert conn.execute(
-                "SELECT count(*) AS n FROM schema_migrations WHERE version = '0002'"
+                "SELECT count(*) AS n FROM schema_migrations WHERE version = '0099'"
             ).fetchone()["n"] == 0
 
     @pytest.mark.db

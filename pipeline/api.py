@@ -43,6 +43,7 @@ from slowapi.util import get_remote_address
 from temporalio.client import Client, WorkflowFailureError
 
 from . import db, document_validity, scheme_catalog
+from .advisory_start import start_advisory_index, start_advisory_promote
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.deps import (
     CurrentUser,
@@ -122,6 +123,8 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     datefmt='%H:%M:%S',
 )
+
+logger = logging.getLogger(__name__)
 
 TASK_QUEUE = "ocr-pipeline"
 _TOKEN_RE = re.compile(r"[\w\-]+", re.UNICODE)
@@ -250,6 +253,11 @@ RATE_LIMIT_UPLOAD = os.environ.get("RATE_LIMIT_UPLOAD", "10/minute")
 RATE_LIMIT_OTP = os.environ.get("RATE_LIMIT_OTP", "10/minute")
 
 _DOCUMENT_PATH_RE = re.compile(r"^/documents/([^/]+)(/.*)?$")
+# Only identifier shapes with an indexed lookup are resolved before auth runs:
+# the document UUID, the 32-hex fingerprint, or a ``doc-<md5>`` workflow id.
+_RESOLVABLE_IDENTIFIER_RE = re.compile(
+    r"^(?:[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}|[0-9a-f]{32}|doc-[0-9a-f]{32}.*)$"
+)
 _static_document_segments: Optional[set[str]] = None
 
 
@@ -272,10 +280,15 @@ async def canonicalize_document_identifier(request: Request, call_next):
 
     Handlers address a document by its Temporal workflow id (they signal and
     query Temporal with it), so the path is rewritten to that id before routing.
-    An identifier that matches no document is left alone and 404s in the handler.
+    An identifier of another shape, or one that matches no document, is left alone and
+    404s in the handler; the lookup runs before auth, so it is limited to cheap shapes.
     """
     match = _DOCUMENT_PATH_RE.match(request.scope["path"])
-    if match and match.group(1) not in _static_document_path_segments():
+    if (
+        match
+        and _RESOLVABLE_IDENTIFIER_RE.match(match.group(1))
+        and match.group(1) not in _static_document_path_segments()
+    ):
         document = await asyncio.to_thread(db.find_document_by_doc_identifier, match.group(1))
         if document and document["workflow_id"] and document["workflow_id"] != match.group(1):
             new_path = f"/documents/{document['workflow_id']}{match.group(2) or ''}"
@@ -4094,11 +4107,78 @@ async def webhook(
         count = db.upsert_webhook_records("webhook", records)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    await _start_advisory_index_for(records)
     return {
         "success": True,
         "message": "Webhook processed successfully.",
         "recordCount": count,
     }
+
+
+async def _start_advisory_index_for(records: list) -> int:
+    """Start one advisory index workflow per record of this call that is not indexed yet.
+
+    Best effort: the records are already saved, so a Temporal failure never fails the
+    webhook; the rows stay unindexed and the reindex endpoint (or worker startup backfill)
+    picks them up.
+    """
+    if temporal_client is None:
+        logger.warning("Temporal client not ready; advisory indexing skipped for this webhook call")
+        return 0
+    try:
+        external_ids = [db.webhook_external_id(r) for r in records if isinstance(r, dict)]
+        record_ids = db.get_unindexed_webhook_record_ids(external_ids=external_ids)
+        return await start_advisory_index(temporal_client, record_ids)
+    except Exception:
+        logger.exception("Could not start advisory indexing for this webhook call")
+        return 0
+
+
+class AdvisoryReindexBody(BaseModel):
+    record_ids: Optional[List[str]] = None
+    force: bool = False
+
+
+class AdvisoryPromoteBody(BaseModel):
+    record_ids: Optional[List[str]] = None
+
+
+def _require_temporal() -> Client:
+    if temporal_client is None:
+        raise HTTPException(503, "Temporal client is not ready")
+    return temporal_client
+
+
+@app.post("/webhook/advisory/reindex")
+async def advisory_reindex(body: AdvisoryReindexBody, user: RequireAdmin):
+    """Queue advisory indexing (dev collection): given record ids, else all unindexed (all with force)."""
+    client = _require_temporal()
+    if body.record_ids is not None:
+        record_ids = body.record_ids
+    elif body.force:
+        record_ids = db.get_webhook_record_ids()
+    else:
+        record_ids = db.get_unindexed_webhook_record_ids()
+    queued = await start_advisory_index(client, record_ids)
+    return {"success": True, "queued": queued}
+
+
+@app.post("/webhook/advisory/promote")
+async def advisory_promote(body: AdvisoryPromoteBody, user: RequireAdmin):
+    """Queue promotion to the PROD collection: given record ids, else all published records."""
+    client = _require_temporal()
+    if body.record_ids is not None:
+        record_ids = body.record_ids
+    else:
+        record_ids = db.get_webhook_record_ids(published_only=True)
+    queued = await start_advisory_promote(client, record_ids)
+    return {"success": True, "queued": queued}
+
+
+@app.get("/webhook/advisory/status")
+async def advisory_status(user: RequireAdmin):
+    """Counts of webhook advisory records: total, published, indexed, unindexed, promoted."""
+    return db.advisory_status_counts()
 
 
 # =============================================================================
