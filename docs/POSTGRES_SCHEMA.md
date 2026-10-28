@@ -45,7 +45,7 @@ The database does not check these values, so adding one needs no migration. Raw 
 |---|---|---|
 | 1 | `groups` | Provider tenant nodes (`/states/MH`, `/global`), mirrored from Keycloak |
 | 2 | `users` | People who upload, review and act, mirrored from Keycloak |
-| 3 | `catalogs` | One row per provider group and resource type (scheme, advisory) |
+| 3 | `catalogs` | One row per provider group and resource type (scheme, advisory, video) |
 | 4 | `documents` | One row per document. Content, metadata, source file, index state |
 | 5 | `workflows` | One row per processing run of a document. Stage, status, config |
 | 6 | `workflow_artifacts` | Files each workflow produces, stored in MinIO |
@@ -148,7 +148,7 @@ Unique: `(group_id, type)`.
 Pydantic (`CatalogMetadata`) validates the keys; the database only checks for an object.
 
 Notes
-- `type` stores the schema name, and code asks `pipeline/network_constants.py` what it means (`catalog_type_for_kind`, `kind_for_catalog_type`) instead of comparing `openagrinet:*` strings. The mapping is a placeholder: `scheme` is `openagrinet:AgricultureResource`, `advisory` is `openagrinet:KnowledgeAdvisory` (see ADR 0003 and ADR 0006).
+- `type` stores the schema name, and code asks `pipeline/network_constants.py` what it means (`catalog_type_for_kind`, `kind_for_catalog_type`) instead of comparing `openagrinet:*` strings. The mapping is a placeholder: `scheme` is `openagrinet:AgricultureResource`, `advisory` is `openagrinet:KnowledgeAdvisory`, `video` is `openagrinet:VideoResource` (see ADR 0003 and ADR 0006).
 - Catalogs are created on upload (`get_or_create_catalog`), not seeded.
 - Computed catalog values (status, chunk count, network visibility, `promoted_at`) come from the `catalog_status` view, not stored here.
 

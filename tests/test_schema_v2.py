@@ -115,7 +115,7 @@ class TestCatalogs:
     @pytest.mark.unit
     def test_a_kind_without_a_catalog_type_is_rejected(self, db_connection):
         with pytest.raises(ValueError):
-            db_connection.get_or_create_catalog(_group(db_connection), "video")
+            db_connection.get_or_create_catalog(_group(db_connection), "podcast")
 
     @pytest.mark.db
     @pytest.mark.unit

@@ -33,6 +33,7 @@ const FILE_TYPE_CHIPS = ['PDF', 'Word']
 const DOCUMENT_TYPE_OPTIONS = [
   { value: 'scheme', label: 'Scheme' },
   { value: 'advisory', label: 'Advisory' },
+  { value: 'video', label: 'Video' },
 ]
 
 const PIPELINE_STEPS = [

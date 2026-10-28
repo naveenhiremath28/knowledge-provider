@@ -1042,7 +1042,7 @@ class TestUploadCatalogIdentity:
 
     @pytest.mark.api
     @pytest.mark.unit
-    @pytest.mark.parametrize("kind", ["document", "video", "", "Scheme-X"])
+    @pytest.mark.parametrize("kind", ["document", "podcast", "", "Scheme-X"])
     def test_an_unknown_kind_is_rejected(self, test_client, sample_pdf_content, kind):
         response = test_client.post(
             "/upload",

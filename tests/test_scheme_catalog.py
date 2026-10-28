@@ -153,7 +153,7 @@ def test_apply_scheme_metadata_keeps_the_code_when_only_the_name_changes(catalog
     assert result["code_renamed"] is False
 
 
-def test_kind_is_limited_to_scheme_and_advisory(catalog_db):
+def test_kind_is_limited_to_the_known_kinds(catalog_db):
     db, scheme_catalog = catalog_db
     _doc(db, "wf-kind", code="kind-doc", stage="ready_for_ingestion")
     assert db.get_document("wf-kind")["kind"] == "scheme"
@@ -162,10 +162,13 @@ def test_kind_is_limited_to_scheme_and_advisory(catalog_db):
     assert result["document"]["kind"] == "advisory"
     assert result["document"]["code"] == "kind-doc"  # moved catalogs, kept its code
 
+    result = scheme_catalog.apply_scheme_metadata("wf-kind", kind="video")
+    assert result["document"]["kind"] == "video"
+
     result = scheme_catalog.apply_scheme_metadata("wf-kind", kind="scheme")
     assert result["document"]["kind"] == "scheme"
 
-    for bad in ("how_to_faq", "document", "video", "Not Valid!!"):
+    for bad in ("how_to_faq", "document", "podcast", "Not Valid!!"):
         with pytest.raises(ValueError):
             scheme_catalog.apply_scheme_metadata("wf-kind", kind=bad)
     assert db.get_document("wf-kind")["kind"] == "scheme"
@@ -328,11 +331,11 @@ def test_scheme_metadata_api_rejects_an_unknown_kind(asgi_client):
     from pipeline import db
 
     _doc(db, "wf-meta-bad", code="meta-bad", stage="chunk_review")
-    r = asgi_client.patch("/documents/wf-meta-bad/scheme-metadata", json={"kind": "video"})
+    r = asgi_client.patch("/documents/wf-meta-bad/scheme-metadata", json={"kind": "podcast"})
     assert r.status_code == 400
 
 
-@pytest.mark.parametrize("kind", ["scheme", "advisory"])
+@pytest.mark.parametrize("kind", ["scheme", "advisory", "video"])
 def test_reingest_is_allowed_for_every_kind(asgi_client, mock_temporal_client, kind):
     """No 'never classified' guard any more: a document always has a kind and a code."""
     from pipeline import db
