@@ -66,8 +66,8 @@ Core modules (all under `pipeline/`):
 - `discovery_publish_service.py` — `DiscoveryPublishService`: owns the Publish to Network env vars and the HTTP call. Deliberately Temporal-free
 - `models.py` — Pydantic models, including `DocumentStage` enum and `PIPELINE_STAGES` (the stepper-UI stage list)
 - `config.py` — `Config` dataclass reading env vars, with defaults
-- `instances.py` — instance/tenant (state) code ↔ human name mapping; `bv` = Bharat Vistaar platform-wide, others are state codes matching Keycloak group paths (`/states/MH/...` → `mh`)
-- `scheme_catalog.py` — scheme catalog behind the pull-based `/catalog/v1/*` API, served from the `catalog_entries` table and the computed `catalog` view
+- `group_names.py` — tenant (group) code ↔ human name mapping; `bv` = Bharat Vistaar platform-wide, others are state codes matching Keycloak group paths (`/states/MH/...` → `mh`). A tenant code is a `groups` row (name = code); a document's `group` is derived through `documents.catalog_id → catalogs.group_id`, there is no `documents.instance` column
+- `scheme_catalog.py` — scheme catalog behind the pull-based `/catalog/v1/*` API, served from the computed `catalog_status` view (one row per document; `catalogs` rows are `(group, type)`, `documents` carry `code`/`name`/`aliases`)
 - `ocr/`, `translation/`, `chunking/`, `vector_store/` — pluggable provider packages, each with a `base.py` protocol/ABC and a `service.py` (or equivalent) that dispatches to the configured provider
 - `auth/` — Keycloak JWT validation, group-based tenancy/permissions, email-OTP flow, admin user management
 
@@ -85,7 +85,7 @@ registered → ocr_processing → ocr_review → translation_processing → tran
   → approval_for_prod → ingesting_prod → completed   (or → failed at any point)
 ```
 
-`approval_for_prod`/`ingesting_prod` are **PROD-only stages** (`PROD_ONLY_STAGES` in `models.py`); with `DISABLE_PROD_SETTING=true` a document goes straight from `ingesting` to `completed`. That flag is read only at workflow *start* and passed in as an argument — never read inside a running workflow, since that would break Temporal replay determinism if flipped mid-flight (see the docstring in `instances.py`).
+`approval_for_prod`/`ingesting_prod` are **PROD-only stages** (`PROD_ONLY_STAGES` in `models.py`); with `DISABLE_PROD_SETTING=true` a document goes straight from `ingesting` to `completed`. That flag is read only at workflow *start* and passed in as an argument — never read inside a running workflow, since that would break Temporal replay determinism if flipped mid-flight (see the docstring in `group_names.py`).
 
 ### DEV vs PROD dual indexing
 
