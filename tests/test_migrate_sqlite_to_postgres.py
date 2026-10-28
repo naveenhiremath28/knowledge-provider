@@ -100,6 +100,8 @@ FP2 = hashlib.md5(b"in flight").hexdigest()
 WF1 = f"doc-{FP1}"
 WF2 = f"doc-{FP2}"
 WF3 = "doc-broken"
+WF4 = "doc-plain"
+WF5 = "doc-demo"
 FUTURE = "2099-01-01T00:00:00"
 
 
@@ -139,7 +141,7 @@ def legacy_db(tmp_path):
         conn, "documents", workflow_id=WF2, document_id=FP2, filename="inflight.pdf",
         filepath="/data/documents/inflight.pdf", stage="approval_for_prod", page_count=1,
         created_at="2026-04-01T10:00:00", updated_at="2026-04-01T12:00:00", instance="up",
-        is_demo=1, prod_ready_requested_at="2026-04-02T09:00:00",
+        document_kind="advisory", prod_ready_requested_at="2026-04-02T09:00:00",
         prod_ready_requested_by_user_id="kc-req", prod_ready_requested_by_username="rita",
         ocr_completed_at="2026-04-01T11:00:00",
     )
@@ -147,7 +149,18 @@ def legacy_db(tmp_path):
         conn, "documents", workflow_id=WF3, document_id="not-a-hash", filename="broken.pdf",
         filepath="/tmp/broken.pdf", stage="failed", error_message="OCR blew up",
         created_at="2026-05-01T10:00:00", updated_at="2026-05-01T10:30:00", instance=" ",
-        document_kind="document", scheme_code="Bad Code", valid_from="2026-06-01", valid_to="2026-01-01",
+        document_kind="advisory", scheme_code="Bad Code", valid_from="2026-06-01", valid_to="2026-01-01",
+    )
+    _insert(
+        conn, "documents", workflow_id=WF4, document_id="plain", filename="plain.pdf",
+        filepath="/tmp/plain.pdf", stage="registered", created_at="2026-05-02T10:00:00",
+        updated_at="2026-05-02T10:00:00", instance="mh", document_kind="document",
+    )
+    _insert(
+        conn, "documents", workflow_id=WF5, document_id="demo", filename="demo.pdf",
+        filepath="/tmp/demo.pdf", stage="completed", created_at="2026-05-03T10:00:00",
+        updated_at="2026-05-03T10:00:00", instance="mh", document_kind="scheme", scheme_code="demo-s",
+        is_demo=1,
     )
 
     _insert(conn, "document_jobs", id=1, workflow_id=WF1, job_type="pipeline", temporal_workflow_id=WF1,
@@ -175,6 +188,7 @@ def legacy_db(tmp_path):
     _insert(conn, "pages", workflow_id=WF1, page_number=2, original_markdown="english page",
             detected_language="en", reviewer_notes="fine")
     _insert(conn, "pages", workflow_id="doc-purged", page_number=1, original_markdown="stray")
+    _insert(conn, "pages", workflow_id=WF5, page_number=1, original_markdown="demo page")
 
     _insert(conn, "chunks", workflow_id=WF1, chunk_number=1, original_text="chunk one", token_count=5,
             page_start=1, page_end=2, source_spans_json=json.dumps([{"page_number": 1, "start_char": 0, "end_char": 5}]),
@@ -195,6 +209,8 @@ def legacy_db(tmp_path):
     _insert(conn, "audit_logs", workflow_id=WF1, document_id=FP1, action_type="page_edit",
             entity_type="page", entity_id=1, metadata="not json", timestamp="2026-03-02T12:00:00",
             actor_user_id="kc-rev", actor_username="ravi", actor_email="ravi@x.in", actor_roles="reviewer")
+    _insert(conn, "audit_logs", workflow_id=WF5, document_id="demo", action_type="stage_change",
+            entity_type="document", timestamp="2026-05-03T11:00:00")
     _insert(conn, "audit_logs", workflow_id="doc-purged", document_id="gone", action_type="purge_document",
             entity_type="document", timestamp="2026-02-01T00:00:00")
     _insert(conn, "audit_logs", workflow_id="__system__", document_id="__settings__",
@@ -238,7 +254,7 @@ def _counts(db):
             table: conn.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"]
             for table in (
                 "documents", "workflows", "workflow_artifacts", "pages", "chunks", "audit_logs",
-                "users", "catalog_entries", "email_otps", "webhook_records",
+                "users", "groups", "catalogs", "email_otps", "webhook_records",
             )
         }
 
@@ -252,6 +268,7 @@ class TestSqliteToPostgresMigration:
         report = script.run_migration(legacy_db, postgres_url, dry_run=True)
         assert _counts(db_connection) == before
         assert report.tables["documents"]["inserted"] == 3
+        assert report.tables["documents"]["skipped"] == 2
         assert report.mismatches() == []
 
     def test_a_full_run_maps_every_table(self, db_connection, postgres_url, legacy_db):
@@ -260,21 +277,28 @@ class TestSqliteToPostgresMigration:
 
         assert report.mismatches() == []
         tables = report.as_dict()["tables"]
-        assert tables["documents"]["inserted"] == 3
+        assert tables["documents"] == {"read": 5, "inserted": 3, "skipped": 2}
         assert tables["document_jobs"] == {"read": 3, "inserted": 2, "skipped": 1}
-        assert tables["pages"] == {"read": 3, "inserted": 2, "skipped": 1}
+        assert tables["pages"] == {"read": 4, "inserted": 2, "skipped": 2}
         assert tables["chunks"]["inserted"] == 2
         assert tables["document_manifest_entries"] == {"read": 2, "dropped": 2}
         assert tables["email_otps"] == {"read": 2, "inserted": 1, "dropped": 1}
         assert tables["settings"]["skipped"] == 2
+        assert tables["scheme_catalog_entries"] == {"read": 2, "inserted": 1, "dropped": 1}
+        skipped = {i["key"]: i["reason"] for i in report.skip_reasons if i["table"] == "documents"}
+        assert skipped == {
+            WF4: "document_kind 'document' has no catalog",
+            WF5: "demo document (is_demo)",
+        }
+        assert db.get_document(WF4) is None and db.get_document(WF5) is None
 
         doc = db.get_document(WF1)
         assert doc["stage"] == "completed"
-        assert doc["instance"] == "mh"
+        assert doc["group"] == "mh"
         assert doc["document_id"] == FP1
-        assert doc["display_name"] == "Guideline"
+        assert doc["name"] == "Registry name"  # one name per document in v2
         assert (doc["valid_from"], doc["valid_to"]) == ("2026-03-01", "2027-03-01")
-        assert (doc["scheme_code"], doc["document_kind"]) == ("pm-kmy", "scheme")
+        assert (doc["code"], doc["kind"]) == ("pm-kmy", "scheme")
         assert doc["network_visible"] is False and doc["reindex_required"] is True
         assert doc["uploaded_by_username"] == "uma"
         assert doc["uploaded_by_roles"] == "contributor,reviewer"
@@ -282,6 +306,8 @@ class TestSqliteToPostgresMigration:
         assert doc["ocr_completed_at"] == "2026-03-01T11:00:00"
         assert doc["chunk_count"] == 2
         assert doc["page_count"] == 2
+        assert doc["catalog_id"]
+        assert (doc["name"], doc["aliases"]) == ("Registry name", ["registry"])
         assert set(doc["index_status"]) == {"dev"}
         assert doc["index_status"]["dev"]["index_name"] == "schemes-index"
 
@@ -311,11 +337,31 @@ class TestSqliteToPostgresMigration:
         assert chunks[1]["page_end"] == 2 and chunks[1]["is_excluded"] is True
 
         entries = {e["code"]: e for e in db.list_catalog_entries()}
-        assert entries["cdp"]["source"] == "bootstrap" and entries["cdp"]["status"] == "live"
+        assert set(entries) == {"pm-kmy"}  # the bootstrap-only "cdp" entry has no document
         assert entries["pm-kmy"]["name"] == "Registry name"
         assert entries["pm-kmy"]["status"] == "pending_reindex"
         assert entries["pm-kmy"]["workflow_ids"] == [WF1]
         assert db.get_catalog_meta()["version"] == 6
+
+        with db.get_connection() as conn:
+            groups = {g["path"]: g for g in conn.execute("SELECT * FROM groups").fetchall()}
+            catalogs = conn.execute(
+                "SELECT g.path, c.type FROM catalogs c JOIN groups g ON g.id = c.group_id ORDER BY 1, 2"
+            ).fetchall()
+            meta = conn.execute(
+                "SELECT metadata FROM documents WHERE id = %s::uuid", (doc["id"],)
+            ).fetchone()["metadata"]
+        assert set(groups) == {"/states/MH", "/states/UP", "/states/DEFAULT"}
+        assert all(g["keycloak_group_id"] is None for g in groups.values())
+        assert [(c["path"], c["type"]) for c in catalogs] == [
+            ("/states/DEFAULT", "openagrinet:KnowledgeAdvisory"),
+            ("/states/MH", "openagrinet:AgricultureResource"),
+            ("/states/UP", "openagrinet:KnowledgeAdvisory"),
+        ]
+        assert (meta["valid_from"], meta["valid_to"]) == ("2026-03-01", "2027-03-01")
+        assert meta["uploaded_by_user_id"] == db.get_user_by_keycloak_id("kc-up")["id"]
+        assert meta["index_status"]["dev"]["index_name"] == "schemes-index"
+        assert not {"is_demo", "chunk_count", "display_name"} & set(meta)
 
         users = {u: db.get_user_by_keycloak_id(u) for u in ("kc-up", "kc-rev", "kc-req")}
         assert all(users.values())
@@ -327,6 +373,9 @@ class TestSqliteToPostgresMigration:
         assert edit["metadata"] == json.dumps({"raw": "not json"})
         purged = db.get_audit_logs("doc-purged")
         assert [e["action_type"] for e in purged] == ["purge_document"]
+        demo_trail = db.get_audit_logs(WF5)  # kept for the skipped demo document, tied to its group
+        assert [e["action_type"] for e in demo_trail] == ["stage_change"]
+        assert demo_trail[0]["group"] == "mh"
         settings_log = db.get_settings_audit_logs()
         assert settings_log[0]["field_name"] == "retrieval.alpha"
 
@@ -348,10 +397,10 @@ class TestSqliteToPostgresMigration:
 
         doc = db.get_document(WF2)
         assert doc["stage"] == "approval_for_prod"
-        assert doc["is_demo"] is True
+        assert doc["kind"] == "advisory" and doc["code"] == "inflight"
         assert doc["prod_ready_requested_at"] == "2026-04-02T09:00:00"
         assert doc["prod_ready_requested_by_username"] == "rita"
-        assert doc["instance"] == "up"
+        assert doc["group"] == "up"
         assert doc["ocr_completed_at"] == "2026-04-01T11:00:00"
         types = sorted(j["job_type"] for j in db.list_document_jobs(WF2))
         assert types == ["pipeline", "promote_prod"]
@@ -366,11 +415,11 @@ class TestSqliteToPostgresMigration:
         doc = db.get_document(WF3)
         assert doc["stage"] == "failed" and doc["error_message"] == "OCR blew up"
         assert doc["document_id"] == hashlib.md5(b"not-a-hash").hexdigest()
-        assert doc["instance"] == "default"
-        assert doc["scheme_code"] is None
+        assert doc["group"] == "default"
+        assert doc["kind"] == "advisory" and doc["code"] == "broken"
         assert doc["valid_from"] == "2026-06-01" and doc["valid_to"] is None
         notes = " ".join(report.notes)
-        assert "valid_to cleared" in notes and "not a valid slug" in notes or "plain document" in notes
+        assert "valid_to cleared" in notes and "not a valid slug, code derived" in notes
 
     def test_running_it_twice_changes_nothing(self, db_connection, postgres_url, legacy_db):
         script = _load_script()
@@ -380,7 +429,7 @@ class TestSqliteToPostgresMigration:
         report = script.run_migration(legacy_db, postgres_url)
 
         assert _counts(db_connection) == first
-        assert report.tables["documents"] == {"read": 3, "existing": 3}
+        assert report.tables["documents"] == {"read": 5, "existing": 3, "skipped": 2}
         assert report.tables["audit_logs"]["inserted"] == 0
         assert report.tables["webhook_records"]["existing"] == 1
         assert report.mismatches() == []

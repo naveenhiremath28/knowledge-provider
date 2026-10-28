@@ -84,7 +84,7 @@ def test_claims_to_user_maps_keycloak_shape():
     assert Permission.UPLOAD in user.permissions
     assert user.instances == ["tenant-a", "tenant-b"]
     assert user.envs == ["dev"]
-    assert user.has_instance("Tenant-A")
+    assert user.has_group("Tenant-A")
     assert not user.has_env("prod")
 
 

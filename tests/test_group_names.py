@@ -1,9 +1,9 @@
-"""Tests for instance code → state name resolution."""
+"""Tests for group (tenant) code → state name resolution."""
 
 import pytest
 
 
-class TestInstanceDisplayName:
+class TestGroupDisplayName:
     @pytest.mark.unit
     @pytest.mark.parametrize(
         "code,expected",
@@ -22,30 +22,30 @@ class TestInstanceDisplayName:
         ],
     )
     def test_known_codes(self, code, expected):
-        from pipeline.instances import instance_display_name
+        from pipeline.group_names import group_display_name
 
-        assert instance_display_name(code) == expected
+        assert group_display_name(code) == expected
 
     @pytest.mark.unit
     @pytest.mark.parametrize("code,expected", [("or", "Odisha"), ("od", "Odisha"), ("ts", "Telangana"), ("tg", "Telangana")])
     def test_legacy_code_aliases(self, code, expected):
-        from pipeline.instances import instance_display_name
+        from pipeline.group_names import group_display_name
 
-        assert instance_display_name(code) == expected
+        assert group_display_name(code) == expected
 
     @pytest.mark.unit
     def test_blank_falls_back_to_default(self):
-        from pipeline.instances import instance_display_name
+        from pipeline.group_names import group_display_name
 
-        assert instance_display_name("") == "Default"
-        assert instance_display_name(None) == "Default"
+        assert group_display_name("") == "Default"
+        assert group_display_name(None) == "Default"
 
     @pytest.mark.unit
     def test_unknown_code_is_made_presentable(self):
         """A new state must degrade to a readable label, never break ingestion."""
-        from pipeline.instances import instance_display_name
+        from pipeline.group_names import group_display_name
 
-        assert instance_display_name("new-state") == "New State"
+        assert group_display_name("new-state") == "New State"
 
 
 class TestProdStageDisabled:
@@ -54,7 +54,7 @@ class TestProdStageDisabled:
     @pytest.mark.unit
     @pytest.mark.parametrize("value", ["true", "TRUE", "True", "1", "yes", "YES"])
     def test_truthy_values_disable_prod(self, monkeypatch, value):
-        from pipeline.instances import prod_stage_disabled
+        from pipeline.group_names import prod_stage_disabled
 
         monkeypatch.setenv("DISABLE_PROD_SETTING", value)
         assert prod_stage_disabled() is True
@@ -62,7 +62,7 @@ class TestProdStageDisabled:
     @pytest.mark.unit
     @pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", "", "anything-else"])
     def test_other_values_keep_prod_enabled(self, monkeypatch, value):
-        from pipeline.instances import prod_stage_disabled
+        from pipeline.group_names import prod_stage_disabled
 
         monkeypatch.setenv("DISABLE_PROD_SETTING", value)
         assert prod_stage_disabled() is False
@@ -70,14 +70,14 @@ class TestProdStageDisabled:
     @pytest.mark.unit
     def test_defaults_to_enabled_when_unset(self, monkeypatch):
         """Absent flag must keep the full pipeline — never silently skip PROD."""
-        from pipeline.instances import prod_stage_disabled
+        from pipeline.group_names import prod_stage_disabled
 
         monkeypatch.delenv("DISABLE_PROD_SETTING", raising=False)
         assert prod_stage_disabled() is False
 
     @pytest.mark.unit
     def test_whitespace_is_tolerated(self, monkeypatch):
-        from pipeline.instances import prod_stage_disabled
+        from pipeline.group_names import prod_stage_disabled
 
         monkeypatch.setenv("DISABLE_PROD_SETTING", "  true  ")
         assert prod_stage_disabled() is True
@@ -121,7 +121,7 @@ class TestProdOnlyStages:
      ("true", True), ("TRUE", True), (" 1 ", True), ("yes", True)],
 )
 def test_publish_to_network_enabled(monkeypatch, value, expected):
-    from pipeline.instances import publish_to_network_enabled
+    from pipeline.group_names import publish_to_network_enabled
 
     if value is None:
         monkeypatch.delenv("PUBLISH_TO_NETWORK", raising=False)

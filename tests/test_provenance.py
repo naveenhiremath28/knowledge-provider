@@ -1,12 +1,20 @@
 """Tests for vector-store provenance ingest fields and /provenance/chunk resolver."""
 
 import hashlib
+import itertools
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pipeline.activities import prepare_ingestion_records
 from pipeline.api import app
+
+_code_seq = itertools.count(1)
+
+
+def _next_code() -> str:
+    """A unique document code for fixtures (documents need one in v2)."""
+    return f"doc-{next(_code_seq)}"
 
 
 @pytest.mark.unit
@@ -52,12 +60,14 @@ def test_find_document_by_legacy_doc_id_hash(db_connection):
     document_id = "legacy-doc-id-001"
     workflow_id = "doc-legacy000001"
     db.upsert_document(
+        kind="scheme",
+        code=_next_code(),
         workflow_id=workflow_id,
         document_id=document_id,
         filename="legacy.pdf",
         filepath="/tmp/legacy.pdf",
         stage="completed",
-        display_name="Legacy PDF",
+        name="Legacy PDF",
     )
     db.save_chunks(
         workflow_id,
@@ -97,12 +107,14 @@ def test_provenance_chunk_endpoint(db_connection):
     workflow_id = "doc-provenance01"
     document_id = hashlib.md5(b"prov-doc-id-xyz").hexdigest()
     db.upsert_document(
+        kind="scheme",
+        code=_next_code(),
         workflow_id=workflow_id,
         document_id=document_id,
         filename="prov.pdf",
         filepath="/tmp/prov.pdf",
         stage="completed",
-        display_name="Provenance PDF",
+        name="Provenance PDF",
     )
     db.save_chunks(
         workflow_id,

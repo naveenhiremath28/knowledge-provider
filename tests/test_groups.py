@@ -9,11 +9,11 @@ from pipeline.auth.groups import (
     ROLE_STATE_VIEW,
     ROLE_SUPER_ADMIN,
     parse_group_paths,
-    role_for_instance,
+    role_for_group,
 )
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.permissions import Permission, UserRole, permissions_for_roles
-from pipeline.auth.tenancy import allowed_instances, user_can_access_instance
+from pipeline.auth.tenancy import allowed_groups, user_can_access_group
 
 
 def test_parse_global_super_admin():
@@ -33,9 +33,9 @@ def test_parse_multi_state_roles():
     assert access.is_super_admin is False
     assert access.state_roles == {"mh": ROLE_STATE_ADMIN, "up": ROLE_STATE_VIEW}
     assert set(access.instances) == {"mh", "up"}
-    assert role_for_instance(access, "MH") == ROLE_STATE_ADMIN
-    assert role_for_instance(access, "up") == ROLE_STATE_VIEW
-    assert role_for_instance(access, "bh") is None
+    assert role_for_group(access, "MH") == ROLE_STATE_ADMIN
+    assert role_for_group(access, "up") == ROLE_STATE_VIEW
+    assert role_for_group(access, "bh") is None
 
 
 def test_approver_and_contributor_paths():
@@ -61,17 +61,17 @@ def test_contributor_approves_stages_but_cannot_publish_to_dev():
 
     # OCR / translation / chunk approvals all ride on REVIEW.
     assert user.has_permission(Permission.REVIEW)
-    assert user.has_permission_for_instance(Permission.REVIEW, "up")
+    assert user.has_permission_for_group(Permission.REVIEW, "up")
     # …but publishing to DEV is its own permission.
     assert not user.has_permission(Permission.APPROVE_INGESTION)
-    assert not user.has_permission_for_instance(Permission.APPROVE_INGESTION, "up")
+    assert not user.has_permission_for_group(Permission.APPROVE_INGESTION, "up")
     assert not user.has_permission(Permission.DELETE_OWN)
 
     # Approver and admin both clear the DEV publish gate.
     for group, role in (("approver", "state_approver"), ("admin", "state_admin")):
         stronger = claims_to_user({"sub": role, "groups": [f"/states/UP/{group}"]})
         assert stronger.has_permission(Permission.APPROVE_INGESTION), role
-        assert stronger.has_permission_for_instance(Permission.APPROVE_INGESTION, "up"), role
+        assert stronger.has_permission_for_group(Permission.APPROVE_INGESTION, "up"), role
 
     # Only the admin may delete.
     approver = claims_to_user({"sub": "a", "groups": ["/states/UP/approver"]})
@@ -109,14 +109,14 @@ def test_bh_viewer_reads_every_state_without_write():
     assert access.is_super_admin is False
     assert access.state_roles == {}
     # No per-state group, but any state resolves to view.
-    assert role_for_instance(access, "mh") == ROLE_STATE_VIEW
-    assert role_for_instance(access, "wb") == ROLE_STATE_VIEW
+    assert role_for_group(access, "mh") == ROLE_STATE_VIEW
+    assert role_for_group(access, "wb") == ROLE_STATE_VIEW
 
 
 def test_bh_viewer_keeps_stronger_state_role():
     access = parse_group_paths(["/global/bh-viewer", "/states/MH/admin"])
-    assert role_for_instance(access, "mh") == ROLE_STATE_ADMIN
-    assert role_for_instance(access, "up") == ROLE_STATE_VIEW
+    assert role_for_group(access, "mh") == ROLE_STATE_ADMIN
+    assert role_for_group(access, "up") == ROLE_STATE_VIEW
 
 
 def test_higher_role_wins_same_state():
@@ -172,17 +172,17 @@ def test_claims_to_user_from_groups_only():
     assert user.state_roles["mh"] == "state_admin"
     assert user.state_roles["up"] == "state_view"
     assert user.is_superadmin is False
-    assert allowed_instances(user) == {"mh", "up"}
-    assert user_can_access_instance(user, "mh")
-    assert not user_can_access_instance(user, "bh")
+    assert allowed_groups(user) == {"mh", "up"}
+    assert user_can_access_group(user, "mh")
+    assert not user_can_access_group(user, "bh")
     # Union of state_admin + state_view permissions
     assert Permission.UPLOAD in user.permissions
     assert Permission.SEARCH in user.permissions
     assert Permission.MANAGE_USERS not in user.permissions
-    assert user.has_permission_for_instance(Permission.UPLOAD, "mh") is True
-    assert user.has_permission_for_instance(Permission.UPLOAD, "up") is False
-    assert user.has_permission_for_instance(Permission.SEARCH, "up") is True
-    assert user.has_permission_for_instance(Permission.REVIEW, "up") is False
+    assert user.has_permission_for_group(Permission.UPLOAD, "mh") is True
+    assert user.has_permission_for_group(Permission.UPLOAD, "up") is False
+    assert user.has_permission_for_group(Permission.SEARCH, "up") is True
+    assert user.has_permission_for_group(Permission.REVIEW, "up") is False
 
 
 def test_claims_super_admin_unrestricted():
@@ -194,8 +194,8 @@ def test_claims_super_admin_unrestricted():
         }
     )
     assert user.is_superadmin is True
-    assert allowed_instances(user) is None
-    assert user_can_access_instance(user, "mh")
+    assert allowed_groups(user) is None
+    assert user_can_access_group(user, "mh")
     assert Permission.MANAGE_USERS in user.permissions
 
 
@@ -210,5 +210,5 @@ def test_legacy_instances_claim_still_works():
     )
     assert user.instances == ["tenant-a"]
     assert Permission.UPLOAD in user.permissions
-    assert user_can_access_instance(user, "tenant-a")
-    assert not user_can_access_instance(user, "mh")
+    assert user_can_access_group(user, "tenant-a")
+    assert not user_can_access_group(user, "mh")

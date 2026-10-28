@@ -11,6 +11,7 @@ Tests cover:
 """
 
 import hashlib
+import itertools
 import os
 
 import pytest
@@ -19,6 +20,14 @@ import pytest
 os.environ["MINIO_ACCESS_KEY"] = "test-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret"
 os.environ["ALLOWED_FILE_PATHS"] = "/app/books,/tmp"
+
+
+_code_seq = itertools.count(1)
+
+
+def _next_code() -> str:
+    """A unique document code for fixtures (documents need one in v2)."""
+    return f"doc-{next(_code_seq)}"
 
 
 class TestHealthEndpoints:
@@ -68,6 +77,8 @@ class TestDocumentEndpoints:
         """Test listing documents."""
         # Create a test document
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id="api-test-001",
             document_id="doc-001",
             filename="test.pdf",
@@ -85,6 +96,8 @@ class TestDocumentEndpoints:
     def test_list_documents_with_stage_filter(self, test_client, db_connection):
         """Test filtering documents by stage."""
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id="filter-api-001",
             document_id="doc-filter-001",
             filename="completed.pdf",
@@ -104,6 +117,8 @@ class TestDocumentEndpoints:
         """Test getting document details from the database."""
         workflow_id = "get-test-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-get-001",
             filename="test.pdf",
@@ -132,6 +147,8 @@ class TestDocumentIdentifiers:
 
     def _document(self, db_connection):
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=self.WORKFLOW_ID,
             document_id=self.FINGERPRINT,
             filename="identifiers.pdf",
@@ -185,6 +202,8 @@ class TestDocumentIdentifiers:
     @pytest.mark.unit
     def test_static_document_routes_are_not_mistaken_for_identifiers(self, test_client, db_connection):
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id="summary", document_id=hashlib.md5(b"summary").hexdigest(),
             filename="summary", filepath="/tmp/s.pdf",
         )
@@ -203,6 +222,8 @@ class TestArtifactAndJobIdentifiers:
 
     def _document(self, db_connection):
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id="wf-art-api", document_id=hashlib.md5(b"art").hexdigest(),
             filename="a.pdf", filepath="minio://documents/a.pdf", stage="ocr_review",
         )
@@ -271,6 +292,8 @@ class TestProdApproval:
 
     def _document_at_the_gate(self, db_connection, workflow_id):
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id=f"doc-{workflow_id}",
             filename="test.pdf",
@@ -334,6 +357,8 @@ class TestProdApproval:
     def test_the_wrong_stage_is_still_refused(self, test_client, db_connection):
         workflow_id = "prod-approval-005"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id=f"doc-{workflow_id}",
             filename="test.pdf",
@@ -356,6 +381,8 @@ class TestDocumentValidityEndpoints:
 
     def _uploaded_document(self, db_connection, workflow_id):
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id=f"doc-{workflow_id}",
             filename="test.pdf",
@@ -375,6 +402,7 @@ class TestDocumentValidityEndpoints:
 
         response = test_client.post(
             "/upload",
+            params={"kind": "scheme"},
             files={"file": ("validity-upload.pdf", sample_pdf_content, "application/pdf")},
         )
 
@@ -393,13 +421,13 @@ class TestDocumentValidityEndpoints:
 
         set_response = test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
-            json={"document_kind": "advisory", "valid_from": "2026-01-01", "valid_to": "2026-06-30"},
+            json={"kind": "advisory", "valid_from": "2026-01-01", "valid_to": "2026-06-30"},
         )
         assert set_response.json()["valid_to"] == "2026-06-30"
 
         cleared = test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
-            json={"document_kind": "advisory", "valid_to": ""},
+            json={"kind": "advisory", "valid_to": ""},
         )
 
         assert cleared.status_code == 200
@@ -429,7 +457,7 @@ class TestDocumentValidityEndpoints:
         response = test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
             json={
-                "document_kind": "advisory",
+                "kind": "advisory",
                 "valid_from": "2026-10-01",
                 "valid_to": "2026-12-31",
             },
@@ -451,7 +479,7 @@ class TestDocumentValidityEndpoints:
 
         response = test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
-            json={"document_kind": "advisory", "valid_to": "2027-06-30"},
+            json={"kind": "advisory", "valid_to": "2027-06-30"},
         )
 
         assert response.status_code == 200
@@ -467,7 +495,7 @@ class TestDocumentValidityEndpoints:
 
         test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
-            json={"document_kind": "advisory"},
+            json={"kind": "advisory"},
         )
 
         stored = db_connection.get_document(workflow_id)
@@ -483,7 +511,7 @@ class TestDocumentValidityEndpoints:
         response = test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
             json={
-                "document_kind": "advisory",
+                "kind": "advisory",
                 "valid_from": "2026-12-31",
                 "valid_to": "2026-01-01",
             },
@@ -500,7 +528,7 @@ class TestDocumentValidityEndpoints:
 
         response = test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
-            json={"document_kind": "advisory", "valid_to": "31-12-2026"},
+            json={"kind": "advisory", "valid_to": "31-12-2026"},
         )
 
         assert response.status_code == 400
@@ -517,13 +545,13 @@ class TestDocumentValidityEndpoints:
 
         test_client.patch(
             f"/documents/{workflow_id}/scheme-metadata",
-            json={"document_kind": "advisory", "valid_to": "not-a-date"},
+            json={"kind": "advisory", "valid_to": "not-a-date"},
         )
 
         stored = db_connection.get_document(workflow_id)
         assert stored["valid_from"] == "2026-01-01"
         assert stored["valid_to"] == "2026-06-30"
-        assert (stored["document_kind"] or "document") == "document"
+        assert stored["kind"] == "scheme"
 
     @pytest.mark.api
     @pytest.mark.unit
@@ -663,6 +691,8 @@ class TestPageEndpoints:
         """Test listing pages for a document."""
         workflow_id = "pages-test-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-pages",
             filename="test.pdf",
@@ -689,6 +719,8 @@ class TestPageEndpoints:
         """Test getting a specific page."""
         workflow_id = "page-get-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-page",
             filename="test.pdf",
@@ -712,6 +744,8 @@ class TestPageEndpoints:
         """Test validation rejects invalid page numbers."""
         workflow_id = "page-invalid-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-invalid",
             filename="test.pdf",
@@ -733,6 +767,8 @@ class TestPageEndpoints:
         """Test updating a page."""
         workflow_id = "page-update-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-update",
             filename="test.pdf",
@@ -763,6 +799,8 @@ class TestChunkEndpoints:
         """Test listing chunks for a document."""
         workflow_id = "chunks-test-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-chunks",
             filename="test.pdf",
@@ -789,6 +827,8 @@ class TestChunkEndpoints:
         """Test including excluded chunks in listing."""
         workflow_id = "chunks-excluded-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-excluded",
             filename="test.pdf",
@@ -819,6 +859,8 @@ class TestChunkEndpoints:
         """Test validation rejects invalid chunk numbers."""
         workflow_id = "chunk-invalid-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-chunk-invalid",
             filename="test.pdf",
@@ -839,6 +881,8 @@ class TestAuditEndpoints:
         """Test getting audit logs for a document."""
         workflow_id = "audit-test-001"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-audit",
             filename="test.pdf",
@@ -933,6 +977,8 @@ class TestErrorHandling:
         """Test 404 for missing page."""
         workflow_id = "page-404-test"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-404",
             filename="test.pdf",
@@ -966,3 +1012,194 @@ class TestPdfHeaders:
         assert header.count(":") >= 1
         assert "\r\nX-Injected" not in header
         assert header.startswith('inline; filename="')
+
+
+class TestUploadCatalogIdentity:
+    """/upload picks the tenant's catalog from ``kind`` and names the document by ``code``."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_rate_limit(self):
+        # /upload is limited per IP; these tests post more often than one minute allows.
+        import pipeline.api as api
+
+        api.limiter.reset()
+        yield
+        api.limiter.reset()
+
+    @staticmethod
+    def _pdf(sample_pdf_content: bytes, tag: str) -> bytes:
+        # A different trailer gives a different fingerprint, hence a new workflow id.
+        return sample_pdf_content + f"\n% {tag}".encode()
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_kind_is_required(self, test_client, sample_pdf_content):
+        response = test_client.post(
+            "/upload", files={"file": ("a.pdf", sample_pdf_content, "application/pdf")}
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    @pytest.mark.parametrize("kind", ["document", "video", "", "Scheme-X"])
+    def test_an_unknown_kind_is_rejected(self, test_client, sample_pdf_content, kind):
+        response = test_client.post(
+            "/upload",
+            params={"kind": kind},
+            files={"file": ("a.pdf", sample_pdf_content, "application/pdf")},
+        )
+
+        assert response.status_code == 400
+        assert "scheme" in response.json()["detail"]
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_an_invalid_code_is_rejected(self, test_client, sample_pdf_content):
+        response = test_client.post(
+            "/upload",
+            params={"kind": "scheme", "code": "Not A Slug"},
+            files={"file": ("a.pdf", sample_pdf_content, "application/pdf")},
+        )
+
+        assert response.status_code == 400
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_upload_creates_the_catalog_and_derives_the_code_from_the_filename(
+        self, test_client, db_connection, sample_pdf_content
+    ):
+        response = test_client.post(
+            "/upload",
+            params={"kind": "scheme", "group": "mh"},
+            files={"file": ("National Mission on Natural Farming.pdf", sample_pdf_content, "application/pdf")},
+        )
+
+        assert response.status_code == 200
+        doc = test_client.get(f"/documents/{response.json()['workflow_id']}").json()
+        assert doc["kind"] == "scheme"
+        assert doc["group"] == "mh"
+        assert doc["code"] == "nmnf"
+        assert doc["name"] == "National Mission on Natural Farming"
+        with db_connection.get_connection() as conn:
+            catalog = conn.execute(
+                "SELECT c.type, g.name, g.path FROM catalogs c JOIN groups g ON g.id = c.group_id"
+            ).fetchall()
+        assert [(r["type"], r["name"], r["path"]) for r in catalog] == [
+            ("openagrinet:AgricultureResource", "mh", "/states/MH")
+        ]
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_a_second_upload_reuses_the_catalog_and_gets_a_fresh_code(
+        self, test_client, db_connection, sample_pdf_content
+    ):
+        first = test_client.post(
+            "/upload",
+            params={"kind": "advisory", "group": "mh"},
+            files={"file": ("Crop Advisory.pdf", self._pdf(sample_pdf_content, "one"), "application/pdf")},
+        )
+        second = test_client.post(
+            "/upload",
+            params={"kind": "advisory", "group": "mh"},
+            files={"file": ("Crop Advisory.pdf", self._pdf(sample_pdf_content, "two"), "application/pdf")},
+        )
+
+        assert first.status_code == second.status_code == 200
+        codes = {
+            test_client.get(f"/documents/{r.json()['workflow_id']}").json()["code"]
+            for r in (first, second)
+        }
+        assert codes == {"ca", "ca-2"}
+        with db_connection.get_connection() as conn:
+            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 1
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_an_existing_code_updates_the_same_document(
+        self, test_client, db_connection, sample_pdf_content
+    ):
+        first = test_client.post(
+            "/upload",
+            params={"kind": "scheme", "group": "mh", "code": "pm-kisan"},
+            files={"file": ("pmkisan.pdf", self._pdf(sample_pdf_content, "v1"), "application/pdf")},
+        )
+        assert first.status_code == 200
+        before = test_client.get(f"/documents/{first.json()['workflow_id']}").json()
+        db_connection.save_pages(
+            before["id"], [{"page_number": 1, "original_markdown": "old text"}]
+        )
+        db_connection.save_chunks(before["id"], [{"chunk_number": 1, "original_text": "old"}])
+
+        second = test_client.post(
+            "/upload",
+            params={"kind": "scheme", "group": "mh", "code": "pm-kisan"},
+            files={"file": ("pmkisan-2026.pdf", self._pdf(sample_pdf_content, "v2"), "application/pdf")},
+        )
+
+        assert second.status_code == 200
+        assert second.json()["workflow_id"] != first.json()["workflow_id"]
+        after = test_client.get(f"/documents/{before['id']}").json()
+        assert after["id"] == before["id"]
+        assert after["filename"] == "pmkisan-2026.pdf"
+        assert after["source_file_fingerprint"] != before["source_file_fingerprint"]
+        assert after["reindex_required"] is True
+        assert after["reindex_reason"] == "source_replaced"
+        assert (after["page_count"], after["chunk_count"]) == (0, 0)
+        with db_connection.get_connection() as conn:
+            assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 1
+            assert conn.execute("SELECT count(*) AS n FROM workflows").fetchone()["n"] == 2
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_the_same_code_in_another_tenant_is_a_different_document(
+        self, test_client, db_connection, sample_pdf_content
+    ):
+        for group, tag in (("mh", "a"), ("gj", "b")):
+            response = test_client.post(
+                "/upload",
+                params={"kind": "scheme", "group": group, "code": "pm-kisan"},
+                files={"file": ("p.pdf", self._pdf(sample_pdf_content, tag), "application/pdf")},
+            )
+            assert response.status_code == 200
+
+        with db_connection.get_connection() as conn:
+            assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 2
+            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 2
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_replacing_a_document_needs_access_to_its_tenant(self, db_connection):
+        from fastapi import HTTPException
+
+        import pipeline.api as api
+        from pipeline.auth.jwt import claims_to_user
+
+        db_connection.upsert_document(
+            workflow_id="wf-mh-doc",
+            document_id="d-mh",
+            filename="a.pdf",
+            filepath="/tmp/a.pdf",
+            group="mh",
+            kind="scheme",
+            code="pm-kisan",
+        )
+        outsider = claims_to_user(
+            {"sub": "u1", "realm_access": {"roles": ["content_curator"]}, "instances": ["gj"]}
+        )
+        insider = claims_to_user(
+            {"sub": "u2", "realm_access": {"roles": ["content_curator"]}, "instances": ["mh"]}
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            api._resolve_document_identity(outsider, "mh", "scheme", "pm-kisan", "a.pdf")
+        assert exc.value.status_code == 404
+
+        kind, code, existing = api._resolve_document_identity(insider, "mh", "scheme", "pm-kisan", "a.pdf")
+        assert (kind, code, existing["workflow_id"]) == ("scheme", "pm-kisan", "wf-mh-doc")
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_the_demo_and_bootstrap_routes_are_gone(self, test_client):
+        assert test_client.post("/documents/anything/demo").status_code in (404, 405)
+        assert test_client.post("/catalog/v1/bootstrap").status_code in (404, 405)

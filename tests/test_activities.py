@@ -10,6 +10,7 @@ Tests cover:
 """
 
 import asyncio
+import itertools
 import os
 from unittest.mock import MagicMock
 
@@ -19,6 +20,14 @@ from temporalio.exceptions import ApplicationError
 os.environ["MINIO_ACCESS_KEY"] = "test-access"
 os.environ["MINIO_SECRET_KEY"] = "test-secret"
 os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
+
+
+_code_seq = itertools.count(1)
+
+
+def _next_code() -> str:
+    """A unique document code for fixtures (documents need one in v2)."""
+    return f"doc-{next(_code_seq)}"
 
 
 class TestChunkingActivity:
@@ -158,7 +167,7 @@ class TestPrepareIngestionRecords:
                 document_id="test-doc",
                 filename="test.pdf",
                 chunks=chunks,
-                instance=code,
+                group=code,
             )
             assert records[0]["instance"] == code
             assert records[0]["instance_name"] == expected
@@ -172,7 +181,7 @@ class TestPrepareIngestionRecords:
         chunks = [{"chunk_number": 1, "original_text": "Test chunk", "token_count": 5}]
 
         advisory = _prepare_records(
-            document_id="test-doc", filename="test.pdf", chunks=chunks, document_kind="advisory"
+            document_id="test-doc", filename="test.pdf", chunks=chunks, kind="advisory"
         )
         assert advisory[0]["document_kind"] == "advisory"
         assert advisory[0]["type"] == "document"
@@ -185,9 +194,9 @@ class TestPrepareIngestionRecords:
             document_id="test-doc",
             filename="test.pdf",
             chunks=chunks,
-            document_kind="scheme",
-            scheme_code="pm-kisan",
-            scheme_name="PM-KISAN",
+            kind="scheme",
+            code="pm-kisan",
+            name="PM-KISAN",
         )
         assert scheme[0]["type"] == "scheme"
         assert scheme[0]["document_kind"] == "scheme"
@@ -203,11 +212,11 @@ class TestPrepareIngestionRecords:
             document_id="test-doc",
             filename="NMEO-OPGUIEDELINES.pdf",
             chunks=chunks,
-            instance="bv",
-            document_kind="scheme",
-            scheme_code="nmeoop",
-            scheme_name="National Mission on Edible Oils - Oil Palm",
-            scheme_aliases=None,
+            group="bv",
+            kind="scheme",
+            code="nmeoop",
+            name="National Mission on Edible Oils - Oil Palm",
+            aliases=None,
         )
 
         record = records[0]
@@ -229,8 +238,8 @@ class TestPrepareIngestionRecords:
             document_id="test-doc",
             filename="test.pdf",
             chunks=chunks,
-            instance="mh",
-            document_kind="document",
+            group="mh",
+            kind="document",
         )
 
         assert "scheme_aliases" not in records[0]
@@ -429,11 +438,19 @@ class TestUpdateDocumentState:
 
         workflow_id = "state-update-test"
         db_connection.upsert_document(
+            kind="scheme",
+            code=_next_code(),
             workflow_id=workflow_id,
             document_id="doc-state",
             filename="test.pdf",
             filepath="/app/books/test.pdf",
             stage="registered"
+        )
+
+        # Page and chunk counts are derived from the pages table, not stored.
+        db_connection.save_pages(
+            workflow_id,
+            [{"page_number": n, "original_markdown": f"page {n}"} for n in range(1, 6)],
         )
 
         asyncio.run(update_document_state(
@@ -548,7 +565,7 @@ class TestPublishCatalogToNetworkActivity:
             "_upload_file_to_minio",
             lambda *a, **k: ("minio://documents/network_publish_skipped.json", 45, "application/json"),
         )
-        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "advisory"})
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"kind": "advisory"})
         monkeypatch.setattr(db, "get_latest_document_job", lambda workflow_id: None)
 
         recorded = {}
@@ -591,9 +608,9 @@ class TestPublishCatalogToNetworkActivity:
             def __init__(self):
                 pass
 
-            def publish(self, transaction_id, document_kind, workflow_id=None):
+            def publish(self, transaction_id, kind, workflow_id=None):
                 assert transaction_id == "txn-1"
-                assert document_kind == "advisory"
+                assert kind == "advisory"
                 assert workflow_id == "wf-1"
                 return fake_result
 
@@ -603,7 +620,7 @@ class TestPublishCatalogToNetworkActivity:
             "_upload_file_to_minio",
             lambda *a, **k: ("minio://documents/network_publish.json", 123, "application/json"),
         )
-        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "advisory"})
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"kind": "advisory"})
         monkeypatch.setattr(db, "get_latest_document_job", lambda workflow_id: {"id": 42})
 
         recorded = {}
@@ -639,11 +656,11 @@ class TestPublishCatalogToNetworkActivity:
         import pipeline.db as db
 
         class FakeService:
-            def publish(self, transaction_id, document_kind, workflow_id=None):
+            def publish(self, transaction_id, kind, workflow_id=None):
                 raise RuntimeError("discovery service unreachable")
 
         monkeypatch.setattr(activities, "DiscoveryPublishService", FakeService)
-        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "advisory"})
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"kind": "advisory"})
 
         add_artifact_calls = []
         monkeypatch.setattr(db, "add_document_artifact", lambda **kwargs: add_artifact_calls.append(kwargs))
@@ -661,7 +678,7 @@ class TestPublishCatalogToNetworkActivity:
         import pipeline.db as db
 
         class FakeService:
-            def publish(self, transaction_id, document_kind, workflow_id=None):
+            def publish(self, transaction_id, kind, workflow_id=None):
                 return {
                     "skipped": True,
                     "envelope": None,
@@ -677,7 +694,7 @@ class TestPublishCatalogToNetworkActivity:
             "_upload_file_to_minio",
             lambda *a, **k: ("minio://documents/network_publish_skipped.json", 45, "application/json"),
         )
-        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "document"})
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"kind": "document"})
         monkeypatch.setattr(db, "get_latest_document_job", lambda workflow_id: None)
 
         recorded = {}
@@ -706,7 +723,7 @@ class TestPublishCatalogToNetworkActivity:
         import pipeline.db as db
 
         class FakeService:
-            def publish(self, transaction_id, document_kind, workflow_id=None):
+            def publish(self, transaction_id, kind, workflow_id=None):
                 return {
                     "skipped": False,
                     "envelope": {"context": {"messageId": "msg-3"}},
@@ -722,7 +739,7 @@ class TestPublishCatalogToNetworkActivity:
             "_upload_file_to_minio",
             lambda *a, **k: ("minio://documents/network_publish.json", 12, "application/json"),
         )
-        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "advisory"})
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"kind": "advisory"})
         monkeypatch.setattr(db, "get_latest_document_job", lambda workflow_id: None)
         monkeypatch.setattr(db, "add_document_artifact", lambda **kwargs: 1)
 
@@ -740,7 +757,7 @@ class TestPublishCatalogToNetworkActivity:
         errors = [{"code": "SCH_SCHEMA_VALIDATION_FAILED", "message": "topics is required"}]
 
         class FakeService:
-            def publish(self, transaction_id, document_kind, workflow_id=None):
+            def publish(self, transaction_id, kind, workflow_id=None):
                 return {
                     "skipped": False,
                     "envelope": {"context": {"messageId": "msg-4"}},
@@ -756,7 +773,7 @@ class TestPublishCatalogToNetworkActivity:
             "_upload_file_to_minio",
             lambda *a, **k: ("minio://documents/network_publish.json", 12, "application/json"),
         )
-        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"document_kind": "advisory"})
+        monkeypatch.setattr(db, "get_document", lambda workflow_id: {"kind": "advisory"})
         monkeypatch.setattr(db, "get_latest_document_job", lambda workflow_id: None)
 
         recorded = {}

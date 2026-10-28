@@ -23,7 +23,7 @@ os.environ["AUTH_DISABLED"] = "true"
 
 
 _TRUNCATE_SQL = """
-    TRUNCATE documents, users, catalog_entries, audit_logs, email_otps,
+    TRUNCATE documents, users, groups, catalogs, audit_logs, email_otps,
              webhook_records, search_settings CASCADE
 """
 
@@ -202,7 +202,9 @@ def sample_document(db_connection):
         document_id=document_id,
         filename="test.pdf",
         filepath="/app/books/test.pdf",
-        stage="registered"
+        stage="registered",
+        kind="scheme",
+        code="test-scheme",
     )
 
     return {

@@ -12,6 +12,7 @@ Tests cover:
 """
 
 import hashlib
+import re
 
 import psycopg
 import pytest
@@ -19,6 +20,30 @@ import pytest
 
 def _md5(text):
     return hashlib.md5(text.encode()).hexdigest()
+
+
+def _code_for(workflow_id):
+    return re.sub(r"[^a-z0-9]+", "-", (workflow_id or "doc").lower()).strip("-") or "doc"
+
+
+@pytest.fixture(autouse=True)
+def _new_documents_default_to_a_scheme(monkeypatch):
+    """A new v2 document needs a kind and a code; these tests are about everything else.
+
+    The requirement itself is pinned in test_schema_v2.py. Here a new document is a
+    scheme whose code is its workflow id, unless a test says otherwise.
+    """
+    from pipeline import db
+
+    real = db.upsert_document
+
+    def with_defaults(*args, **kwargs):
+        kwargs.setdefault("kind", "scheme")
+        if not kwargs.get("code"):
+            kwargs["code"] = _code_for(kwargs.get("workflow_id"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(db, "upsert_document", with_defaults)
 
 
 class TestDocumentOperations:
@@ -133,34 +158,17 @@ class TestDocumentOperations:
             stage="registered"
         )
 
-        db_connection.update_document_stage(
-            workflow_id=workflow_id,
-            stage="ocr_review",
-            page_count=5,
-            chunk_count=10
-        )
+        db_connection.update_document_stage(workflow_id=workflow_id, stage="ocr_review")
 
         doc = db_connection.get_document(workflow_id)
         assert doc["stage"] == "ocr_review"
-        assert doc["page_count"] == 5
-        assert doc["chunk_count"] == 10
-
-    @pytest.mark.db
-    @pytest.mark.unit
-    def test_set_document_demo(self, db_connection):
-        """Test marking document as demo."""
-        workflow_id = "demo-test"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-demo",
-            filename="test.pdf",
-            filepath="/app/books/test.pdf",
-            stage="registered"
-        )
-
-        db_connection.set_document_demo(workflow_id, True)
+        # Counts are derived from pages and chunks, not stored.
+        assert (doc["page_count"], doc["chunk_count"]) == (0, 0)
+        db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "a"}])
+        db_connection.save_chunks(workflow_id, [{"chunk_number": 1, "original_text": "x"},
+                                                {"chunk_number": 2, "original_text": "y"}])
         doc = db_connection.get_document(workflow_id)
-        assert doc["is_demo"] == 1
+        assert (doc["page_count"], doc["chunk_count"]) == (1, 2)
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -606,26 +614,31 @@ def _new_doc(db, workflow_id, **kwargs):
 class TestSchemaConstraints:
     """Rules the database itself enforces."""
 
+    @staticmethod
+    def _catalog_id(db):
+        with db.get_connection() as conn:
+            return db.get_or_create_catalog(db.get_or_create_group("mh", conn=conn), "scheme", conn=conn)["id"]
+
     @pytest.mark.db
     @pytest.mark.unit
-    def test_document_kind_must_match_its_catalog_entry_type(self, db_connection):
+    def test_document_code_must_be_a_slug(self, db_connection):
+        catalog_id = self._catalog_id(db_connection)
         with db_connection.get_connection() as conn:
-            entry = db_connection.upsert_catalog_entry(type="scheme", code="x-scheme", name="X", conn=conn)
-            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            with pytest.raises(psycopg.errors.CheckViolation):
                 conn.execute(
-                    "INSERT INTO documents (instance, source, document_kind, catalog_entry_id) "
-                    "VALUES ('default', %s, 'advisory', %s::uuid)",
-                    (psycopg.types.json.Jsonb({"fingerprint": _md5("k")}), entry["id"]),
+                    "INSERT INTO documents (catalog_id, code, name, source) VALUES (%s::uuid, 'Bad Code', 'N', %s)",
+                    (catalog_id, psycopg.types.json.Jsonb({"fingerprint": _md5("k")})),
                 )
 
     @pytest.mark.db
     @pytest.mark.unit
     def test_source_requires_a_hex_fingerprint(self, db_connection):
+        catalog_id = self._catalog_id(db_connection)
         with db_connection.get_connection() as conn:
             with pytest.raises(psycopg.errors.CheckViolation):
                 conn.execute(
-                    "INSERT INTO documents (instance, source) VALUES ('default', %s)",
-                    (psycopg.types.json.Jsonb({"fingerprint": "not-hex"}),),
+                    "INSERT INTO documents (catalog_id, code, name, source) VALUES (%s::uuid, 'c', 'C', %s)",
+                    (catalog_id, psycopg.types.json.Jsonb({"fingerprint": "not-hex"})),
                 )
 
     @pytest.mark.db
@@ -642,7 +655,8 @@ class TestSchemaConstraints:
     @pytest.mark.db
     @pytest.mark.unit
     def test_validity_period_must_not_end_before_it_starts(self, db_connection):
-        with pytest.raises(psycopg.errors.CheckViolation):
+        # The period lives in documents.metadata, so Pydantic enforces the order.
+        with pytest.raises(ValueError):
             _new_doc(db_connection, "wf-bad-period", valid_from="2026-02-01", valid_to="2026-01-01")
 
     @pytest.mark.db
@@ -889,14 +903,14 @@ class TestChunkRuns:
     @pytest.mark.db
     @pytest.mark.unit
     def test_search_chunks_matches_edited_text_first(self, db_connection):
-        _new_doc(db_connection, "wf-search", instance="mh")
+        _new_doc(db_connection, "wf-search", group="mh")
         db_connection.save_chunks("wf-search", [
             {"chunk_number": 1, "original_text": "alpha beta", "edited_text": "gamma delta"},
         ])
         hits, total = db_connection.search_chunks(query="gamma")
         assert total == 1 and hits[0]["workflow_id"] == "wf-search"
         assert db_connection.search_chunks(query="alpha")[1] == 0
-        assert db_connection.search_chunks(query="gamma", instances=["up"])[1] == 0
+        assert db_connection.search_chunks(query="gamma", groups=["up"])[1] == 0
 
 
 class TestIndexStatus:
@@ -952,7 +966,7 @@ class TestAuditTrail:
     @pytest.mark.db
     @pytest.mark.unit
     def test_audit_outlives_the_document_and_keeps_tenant_scope(self, db_connection):
-        _new_doc(db_connection, "wf-aud", instance="mh")
+        _new_doc(db_connection, "wf-aud", group="mh")
         db_connection.log_audit(
             workflow_id="wf-aud", document_id="x", action_type="purge_document",
             entity_type="document", actor_user_id="kc-9", actor_username="boss",
@@ -964,8 +978,8 @@ class TestAuditTrail:
         assert [entry["action_type"] for entry in logs] == ["purge_document"]
         assert logs[0]["actor"] == "b@x.in (superadmin)"
         assert logs[0]["actor_user_id"] == "kc-9"
-        assert db_connection.get_all_audit_log_count(instances=["mh"]) == 1
-        assert db_connection.get_all_audit_log_count(instances=["up"]) == 0
+        assert db_connection.get_all_audit_log_count(groups=["mh"]) == 1
+        assert db_connection.get_all_audit_log_count(groups=["up"]) == 0
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -1017,10 +1031,10 @@ class TestSearchSettings:
 
 class TestCatalogView:
     @staticmethod
-    def _scheme_doc(db, workflow_id, code, stage, **kwargs):
-        _new_doc(db, workflow_id, stage=stage, **kwargs)
-        db.update_document_fields(
-            workflow_id, document_kind="scheme", scheme_code=code, scheme_name=code.upper(),
+    def _scheme_doc(db, workflow_id, code, stage, kind="scheme", **kwargs):
+        _new_doc(
+            db, workflow_id, stage=stage, kind=kind, code=code,
+            name=code.upper(), **kwargs,
         )
 
     @pytest.mark.db
@@ -1034,7 +1048,6 @@ class TestCatalogView:
         self._scheme_doc(db, "wf-wip", "wip-one", "chunk_review")
         self._scheme_doc(db, "wf-off", "off-one", "completed")
         db.set_document_disabled("wf-off", True)
-        db.upsert_catalog_entry(type="scheme", code="boot-one", name="Boot", source="bootstrap")
 
         status = {e["code"]: e["status"] for e in db.list_catalog_entries()}
         assert status == {
@@ -1043,62 +1056,71 @@ class TestCatalogView:
             "gate-one": "pending_prod",
             "wip-one": "disabled",
             "off-one": "disabled",
-            "boot-one": "live",
         }
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_computed_columns(self, db_connection):
+    def test_computed_columns(self, db_connection, monkeypatch):
+        monkeypatch.setenv("PROD_VECTOR_DB_COLLECTION_NAME", "prod-docs")
         db = db_connection
-        self._scheme_doc(db, "wf-a", "multi", "completed", instance="mh")
-        self._scheme_doc(db, "wf-b", "multi", "completed", instance="up")
+        self._scheme_doc(db, "wf-a", "scheme-a", "completed", group="mh")
+        self._scheme_doc(db, "wf-b", "scheme-b", "completed", group="up")
         db.save_chunks("wf-a", [{"chunk_number": 1, "original_text": "x"}])
         db.save_chunks("wf-b", [{"chunk_number": 1, "original_text": "y"},
                                 {"chunk_number": 2, "original_text": "z"}])
         db.update_document_fields("wf-b", network_visible=False)
-        db.upsert_document_index_status("wf-a", "documents-index", last_indexed_at="2026-05-01T00:00:00")
+        db.upsert_document_index_status("wf-a", "documents-index", last_indexed_at="2026-04-01T00:00:00")
+        db.upsert_document_index_status("wf-a", "prod-docs", last_indexed_at="2026-05-01T00:00:00")
 
-        entry = db.get_catalog_entry("multi")
-        assert entry["instances"] == ["mh", "up"]
-        assert sorted(entry["workflow_ids"]) == ["wf-a", "wf-b"]
-        assert entry["chunk_count"] == 3
-        assert entry["network_visible"] is True
-        assert entry["promoted_at"] is None
-
-    @pytest.mark.db
-    @pytest.mark.unit
-    def test_entries_without_documents_default_to_the_default_instance(self, db_connection):
-        db_connection.upsert_catalog_entry(type="scheme", code="lonely", name="Lonely", source="import")
-        entry = db_connection.get_catalog_entry("lonely")
-        assert entry["instances"] == ["default"]
-        assert entry["status"] == "disabled"
-        assert entry["network_visible"] is False
+        a = db.get_catalog_entry("scheme-a")
+        b = db.get_catalog_entry("scheme-b")
+        assert (a["groups"], a["workflow_ids"], a["chunk_count"]) == (["mh"], ["wf-a"], 1)
+        assert (b["groups"], b["workflow_ids"], b["chunk_count"]) == (["up"], ["wf-b"], 2)
+        assert a["network_visible"] is True and b["network_visible"] is False
+        assert a["promoted_at"].startswith("2026-05-01T00:00:00")
+        assert b["promoted_at"] is None
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_other_entry_types_stay_out_of_the_scheme_listing(self, db_connection):
-        _new_doc(db_connection, "wf-adv", stage="completed")
-        db_connection.update_document_fields(
-            "wf-adv", document_kind="advisory", scheme_code="kharif", scheme_name="Kharif",
-        )
+    def test_catalogs_without_documents_are_not_listed(self, db_connection):
+        db = db_connection
+        with db.get_connection() as conn:
+            db.get_or_create_catalog(db.get_or_create_group("mh", conn=conn), "scheme", conn=conn)
+        assert db.list_catalog_entries() == []
+        assert db.get_catalog_entry("anything") is None
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_other_kinds_stay_out_of_the_scheme_listing(self, db_connection):
+        self._scheme_doc(db_connection, "wf-adv", "kharif", "completed", kind="advisory")
         assert db_connection.list_catalog_entries() == []
-        assert [e["code"] for e in db_connection.list_catalog_entries(type="advisory")] == ["kharif"]
+        assert [e["code"] for e in db_connection.list_catalog_entries(kind="advisory")] == ["kharif"]
+        assert db_connection.list_document_codes("advisory") == {"kharif"}
+        assert db_connection.list_document_codes("scheme") == set()
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_changing_the_kind_moves_or_unlinks_the_entry(self, db_connection):
-        _new_doc(db_connection, "wf-move")
-        db_connection.update_document_fields(
-            "wf-move", document_kind="scheme", scheme_code="movable", scheme_name="Movable",
-        )
-        db_connection.update_document_fields("wf-move", document_kind="advisory")
+    def test_changing_the_kind_moves_the_document_and_rejects_unknown_kinds(self, db_connection):
+        _new_doc(db_connection, "wf-move", kind="scheme", code="movable", name="Movable")
+        before = db_connection.get_document("wf-move")["catalog_id"]
+        db_connection.update_document_fields("wf-move", kind="advisory")
         doc = db_connection.get_document("wf-move")
-        assert (doc["document_kind"], doc["scheme_code"], doc["scheme_name"]) == (
+        assert (doc["kind"], doc["code"], doc["name"]) == (
             "advisory", "movable", "Movable",
         )
-        db_connection.update_document_fields("wf-move", document_kind="document")
-        doc = db_connection.get_document("wf-move")
-        assert doc["scheme_code"] is None and doc["catalog_entry_id"] is None
+        assert doc["catalog_id"] != before
+        with pytest.raises(ValueError):
+            db_connection.update_document_fields("wf-move", kind="document")
+        assert db_connection.get_document("wf-move")["kind"] == "advisory"
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_used_codes_exclude_the_document_itself(self, db_connection):
+        self._scheme_doc(db_connection, "wf-u1", "taken", "completed")
+        self._scheme_doc(db_connection, "wf-u2", "other", "completed")
+        assert db_connection.list_used_scheme_codes() == {"taken", "other"}
+        assert db_connection.list_used_scheme_codes(exclude_workflow_id="wf-u1") == {"other"}
+        assert db_connection.list_used_scheme_codes(kind="advisory") == set()
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -1157,34 +1179,32 @@ class TestOperationsViews:
     @pytest.mark.db
     @pytest.mark.unit
     def test_summary_counts_and_queue_use_the_current_workflow(self, db_connection):
-        _new_doc(db_connection, "wf-q1", stage="ocr_review", instance="mh")
-        _new_doc(db_connection, "wf-q2", stage="completed", instance="up")
+        _new_doc(db_connection, "wf-q1", stage="ocr_review", group="mh")
+        _new_doc(db_connection, "wf-q2", stage="completed", group="up")
         db_connection.create_document_job("wf-q2", "reingest", current_stage="ingesting")
         counts = db_connection.get_document_summary_counts()
         assert counts["total_documents"] == 2
         assert counts["ocr_review_documents"] == 1
         assert counts["completed_documents"] == 0
         assert counts["running_jobs"] == 3
-        assert db_connection.get_document_summary_counts(instances=[])["total_documents"] == 0
-        by_instance = {r["instance"]: r for r in db_connection.get_document_counts_by_instance()}
-        assert by_instance["mh"]["dev_approval"] == 1
+        assert db_connection.get_document_summary_counts(groups=[])["total_documents"] == 0
+        by_group = {r["group"]: r for r in db_connection.get_document_counts_by_group()}
+        assert by_group["mh"]["dev_approval"] == 1
 
         rows, total = db_connection.list_operations_queue()
         assert total == 2
         assert {r["workflow_id"]: r["job_type"] for r in rows} == {
             "wf-q1": "pipeline", "wf-q2": "reingest",
         }
-        assert db_connection.list_operations_queue(instances=["up"])[1] == 1
+        assert db_connection.list_operations_queue(groups=["up"])[1] == 1
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_demo_and_disabled_documents_are_hidden_by_default(self, db_connection):
-        _new_doc(db_connection, "wf-demo")
+    def test_disabled_documents_are_hidden_by_default(self, db_connection):
         _new_doc(db_connection, "wf-off")
-        db_connection.set_document_demo("wf-demo", True)
         db_connection.set_document_disabled("wf-off", True)
         assert db_connection.list_documents() == []
-        assert len(db_connection.list_documents(include_demo=True, include_disabled=True)) == 2
+        assert len(db_connection.list_documents(include_disabled=True)) == 1
 
     @pytest.mark.db
     @pytest.mark.unit
