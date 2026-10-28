@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Button } from '../components/ui/button'
 import { Badge } from '../components/ui/badge'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import {
   Upload,
   FileText,
@@ -234,20 +235,18 @@ export default function NewDocumentView() {
             <label htmlFor="document-kind" className="text-xs font-medium text-foreground">
               Document type
             </label>
-            <select
-              id="document-kind"
-              className="rounded-md border border-input bg-background px-3 py-1 text-xs"
-              value={documentKind}
-              disabled={!canUpload}
-              onChange={(event) => setDocumentKind(event.target.value)}
-            >
-              <option value="">Select type…</option>
-              {DOCUMENT_TYPE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+            <Select value={documentKind} onValueChange={setDocumentKind} disabled={!canUpload}>
+              <SelectTrigger id="document-kind" className="h-8 w-[160px] text-xs">
+                <SelectValue placeholder="Select type…" />
+              </SelectTrigger>
+              <SelectContent>
+                {DOCUMENT_TYPE_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <span className="text-[11px] text-muted-foreground">Required</span>
           </div>
           <div
