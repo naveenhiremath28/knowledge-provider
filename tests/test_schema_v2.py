@@ -673,23 +673,53 @@ class TestSupersededIndexKeys:
 class TestSharedIndexKeys:
     """Two documents holding the same file share an index key; neither may delete it for the other."""
 
+    @staticmethod
+    def _indexed_twin(db, workflow_id, key, env="dev", **kwargs):
+        _doc(db, workflow_id, document_id=key, group="gj", **kwargs)
+        index = "prod-index" if env == "prod" else "documents-index"
+        db.upsert_document_index_status(workflow_id, index, doc_id=key, status="indexed")
+
     @pytest.mark.db
     @pytest.mark.unit
-    def test_a_key_is_in_use_while_another_document_has_that_fingerprint(self, db_connection):
+    def test_a_key_is_in_use_while_another_live_document_is_indexed_under_it(
+        self, db_connection, monkeypatch
+    ):
         db = db_connection
+        monkeypatch.setenv("PROD_VECTOR_DB_COLLECTION_NAME", "prod-index")
         first = _doc(db, "wf-twin-a", document_id="f" * 32)
-        _doc(db, "wf-twin-b", document_id="f" * 32, group="gj")
+        self._indexed_twin(db, "wf-twin-b", "f" * 32, env="dev")
 
-        assert db.doc_id_used_by_other_document("f" * 32, first) is True
-        assert db.doc_id_used_by_other_document("0" * 32, first) is False
+        assert db.doc_id_used_by_other_document("f" * 32, first, "dev") is True
+        # Another environment is checked on its own index entry.
+        assert db.doc_id_used_by_other_document("f" * 32, first, "prod") is False
+        assert db.doc_id_used_by_other_document("0" * 32, first, "dev") is False
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_a_key_is_in_use_while_another_documents_index_entry_holds_it(self, db_connection):
+    def test_an_uploaded_but_unindexed_twin_does_not_block_deletion(self, db_connection):
         db = db_connection
-        first = _doc(db, "wf-idx-a")
-        _doc(db, "wf-idx-b")
-        db.upsert_document_index_status("wf-idx-b", "documents-index", doc_id="9" * 32, status="indexed")
+        first = _doc(db, "wf-up-a", document_id="e" * 32)
+        _doc(db, "wf-up-b", document_id="e" * 32, group="gj")  # same file, never indexed
 
-        assert db.doc_id_used_by_other_document("9" * 32, first) is True
-        assert db.doc_id_used_by_other_document("9" * 32, db.get_document("wf-idx-b")["id"]) is False
+        assert db.doc_id_used_by_other_document("e" * 32, first, "dev") is False
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_a_disabled_twin_does_not_block_deletion(self, db_connection):
+        db = db_connection
+        first = _doc(db, "wf-dis-a", document_id="d" * 32)
+        self._indexed_twin(db, "wf-dis-b", "d" * 32)
+        assert db.doc_id_used_by_other_document("d" * 32, first, "dev") is True
+
+        db.set_document_disabled("wf-dis-b", True)
+
+        assert db.doc_id_used_by_other_document("d" * 32, first, "dev") is False
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_a_document_never_blocks_its_own_key(self, db_connection):
+        db = db_connection
+        only = _doc(db, "wf-own", document_id="c" * 32)
+        db.upsert_document_index_status("wf-own", "documents-index", doc_id="c" * 32, status="indexed")
+
+        assert db.doc_id_used_by_other_document("c" * 32, only, "dev") is False

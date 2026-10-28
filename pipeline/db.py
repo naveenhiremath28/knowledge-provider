@@ -1139,24 +1139,25 @@ def reset_document_for_reupload(
         )
 
 
-def doc_id_used_by_other_document(doc_id: str, exclude_doc_uuid: Optional[str]) -> bool:
-    """True when a document other than ``exclude_doc_uuid`` uses ``doc_id`` as its index key.
+def doc_id_used_by_other_document(doc_id: str, exclude_doc_uuid: Optional[str], env: str) -> bool:
+    """True when another *live* document is indexed in ``env`` (dev/prod) under ``doc_id``.
 
     The index key is the file fingerprint, so two documents holding the same file
     share points in the vector index. Deleting a key another document still needs
-    would remove that document's vectors too.
+    would remove that document's vectors too. Only a document that is not
+    disabled and whose own ``index_status[env]`` holds this key counts: one that
+    was merely uploaded, or is disabled, has nothing in the index to protect.
     """
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT 1 FROM documents d
             WHERE (%s::uuid IS NULL OR d.id <> %s::uuid)
-              AND (d.source->>'fingerprint' = %s
-                   OR EXISTS (SELECT 1 FROM jsonb_each(COALESCE(d.metadata->'index_status', '{}'::jsonb)) e
-                              WHERE e.value->>'doc_id' = %s))
+              AND NOT d.is_disabled
+              AND d.metadata->'index_status'->%s::text->>'doc_id' = %s
             LIMIT 1
             """,
-            (exclude_doc_uuid, exclude_doc_uuid, doc_id, doc_id),
+            (exclude_doc_uuid, exclude_doc_uuid, env, doc_id),
         ).fetchone()
     return row is not None
 

@@ -1398,13 +1398,13 @@ async def _drop_superseded_points(
         store = get_vector_store()
     deleted = []
     for doc_id in stale:
-        # Two documents holding the same file share one index key; keep the
-        # points while another document still needs them and just forget the key.
-        if await asyncio.to_thread(db.doc_id_used_by_other_document, doc_id, doc.get("id")):
+        # Two documents holding the same file share one index key. While another
+        # live document is indexed under it the points stay, and the key stays on
+        # the list so a later ingest, disable or purge can still remove it.
+        if await asyncio.to_thread(db.doc_id_used_by_other_document, doc_id, doc.get("id"), env):
             activity.logger.info(
-                "Keeping %s points for %s: another document uses the same file", env, doc_id
+                "Keeping %s points for %s: another document is indexed under the same key", env, doc_id
             )
-            deleted.append(doc_id)
             continue
         result = await asyncio.to_thread(store.delete_by_doc_id, collection, doc_id)
         if result.get("error"):

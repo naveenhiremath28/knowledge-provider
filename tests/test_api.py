@@ -1293,7 +1293,7 @@ class TestUploadCatalogIdentity:
 class TestVectorKeysToDelete:
     @pytest.mark.api
     @pytest.mark.unit
-    def test_disable_never_deletes_a_key_another_document_uses(self, db_connection):
+    def test_disable_never_deletes_a_key_another_live_document_is_indexed_under(self, db_connection):
         import pipeline.api as api
 
         db = db_connection
@@ -1310,5 +1310,12 @@ class TestVectorKeysToDelete:
             filepath="minio://documents/c.pdf", group="mh", kind="scheme", code="k-c",
         )
 
+        # The twin was only uploaded, never indexed, so nothing of it is at risk.
+        assert api._vector_doc_ids(db.get_document(uuid_a), "dev") == ["a" * 32]
+
+        db.upsert_document_index_status("wf-k-b", "documents-index", doc_id="a" * 32, status="indexed")
         assert api._vector_doc_ids(db.get_document(uuid_a), "dev") == []
         assert api._vector_doc_ids(db.get_document("wf-k-c"), "dev") == ["b" * 32]
+
+        db.set_document_disabled("wf-k-b", True)
+        assert api._vector_doc_ids(db.get_document(uuid_a), "dev") == ["a" * 32]

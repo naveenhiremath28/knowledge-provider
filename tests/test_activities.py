@@ -882,14 +882,17 @@ class TestSupersededPoints:
     @pytest.mark.asyncio
     @pytest.mark.db
     @pytest.mark.unit
-    async def test_a_key_another_document_still_uses_is_kept_in_the_index(self, db_connection):
+    async def test_a_key_another_live_document_is_indexed_under_is_kept_and_remembered(self, db_connection):
         from pipeline import activities
 
         doc_uuid = self._document(db_connection)
-        # A second document holds the very file the first one replaced.
+        # A second document is indexed under the very key the first one replaced.
         db_connection.upsert_document(
             workflow_id="wf-twin", document_id="a" * 32, filename="a.pdf",
             filepath="minio://documents/a.pdf", group="gj", kind="scheme", code="twin",
+        )
+        db_connection.upsert_document_index_status(
+            "wf-twin", "documents-index", doc_id="a" * 32, status="indexed"
         )
         store = self._Store()
 
@@ -897,5 +900,14 @@ class TestSupersededPoints:
             "dev", "wf-sup-act", db_connection.get_document(doc_uuid), "c" * 32, "documents-index", store=store
         )
 
+        # Points stay for the twin, and the key stays on the list for a later cleanup.
         assert store.calls == []
+        assert db_connection.get_document(doc_uuid)["superseded_doc_ids"] == {"dev": ["a" * 32]}
+
+        # Once the twin is gone the same cleanup removes them.
+        db_connection.set_document_disabled("wf-twin", True)
+        await activities._drop_superseded_points(
+            "dev", "wf-sup-act", db_connection.get_document(doc_uuid), "c" * 32, "documents-index", store=store
+        )
+        assert store.calls == [("documents-index", "a" * 32)]
         assert db_connection.get_document(doc_uuid)["superseded_doc_ids"] == {}
