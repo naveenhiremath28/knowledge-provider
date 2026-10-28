@@ -12,10 +12,18 @@ Every migrated row gets a deterministic UUID derived from its legacy key, so a
 second run finds the rows already there and changes nothing. A document is
 migrated in one transaction. ``--dry-run`` runs everything and rolls it back.
 
-Mapping: one legacy ``documents`` row becomes one document plus its main
-workflow (``temporal_workflow_id`` = the legacy ``workflow_id``); each
-``document_jobs`` row becomes a workflow; ``scheme_catalog_*`` becomes
-``catalog_entries``; ``document_manifest_entries`` is dropped.
+Mapping (Schema v2): one legacy ``documents`` row becomes one document plus
+its main workflow (``temporal_workflow_id`` = the legacy ``workflow_id``); each
+``document_jobs`` row becomes a workflow. The legacy ``instance`` becomes a
+``groups`` row (``bv`` is ``/global``, others ``/states/<CODE>``, Keycloak id
+filled in by the first login sync) and the group's ``catalogs`` row for the
+document's kind. ``scheme_code`` / ``scheme_name`` / ``scheme_aliases_json``
+(or the ``scheme_catalog_entries`` registry entry for the code) become the
+document's ``code`` / ``name`` / ``aliases``; the validity period, uploader and
+vector index state move into ``documents.metadata``. Not migrated, and listed in
+the report: documents of kind ``document`` (no catalog), demo documents
+(``is_demo``), registry entries no document uses (bootstrap-only), and
+``document_manifest_entries``.
 """
 
 import argparse
@@ -45,11 +53,11 @@ from pipeline.models import (  # noqa: E402
     PageMetadata,
     PageTranslation,
 )
+from pipeline.network_constants import KIND_TO_CATALOG_TYPE, catalog_type_for_kind  # noqa: E402
 
 _NAMESPACE = uuid.UUID("3f2b6c0e-5d1a-4a53-9a77-0c6a5c1d7e10")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
 _CODE_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-_KIND_RE = re.compile(r"^[a-z0-9]+([_-][a-z0-9]+)*$")
 _STAGES = {
     "registered", "ocr_processing", "ocr_review", "translation_processing",
     "translation_review", "chunking", "chunk_review", "ready_for_ingestion",
@@ -221,7 +229,10 @@ def _get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
 # Catalog
 # -----------------------------------------------------------------------------
 
-def migrate_catalog_registry(sq, conn, report: Report) -> None:
+def load_catalog_registry(sq, report: Report) -> dict[str, dict[str, Any]]:
+    """Legacy ``scheme_catalog_entries`` by code. Their name and aliases are merged
+    into the documents holding the code; see ``settle_catalog_registry``."""
+    registry: dict[str, dict[str, Any]] = {}
     for row in _rows(sq, "scheme_catalog_entries"):
         report.count("scheme_catalog_entries", "read")
         code = (row["scheme_code"] or "").strip().lower()
@@ -229,17 +240,24 @@ def migrate_catalog_registry(sq, conn, report: Report) -> None:
             report.skip("scheme_catalog_entries", str(row["scheme_code"]), "code is not a valid slug")
             continue
         aliases = [a for a in load_json(_get(row, "scheme_aliases_json"), []) if isinstance(a, str) and a]
-        source = _get(row, "source") if _get(row, "source") in ("bootstrap", "pipeline", "import") else "pipeline"
-        inserted = conn.execute(
-            """
-            INSERT INTO catalog_entries (id, type, code, name, aliases, metadata)
-            VALUES (%s::uuid, 'scheme', %s, %s, %s, %s)
-            ON CONFLICT (type, code) DO NOTHING RETURNING id
-            """,
-            (det_id("entry", f"scheme:{code}"), code, row["scheme_name"] or code, aliases,
-             Jsonb({"source": source})),
-        ).fetchone()
-        report.count("scheme_catalog_entries", "inserted" if inserted else "existing")
+        registry[code] = {"name": row["scheme_name"] or code, "aliases": aliases}
+    return registry
+
+
+def settle_catalog_registry(registry: dict[str, dict[str, Any]], consumed: set[str], report: Report) -> None:
+    """Registry entries a migrated document used count as inserted (merged into the
+    document); the rest have no document and are dropped."""
+    unused = []
+    for code in sorted(registry):
+        if code in consumed:
+            report.count("scheme_catalog_entries", "inserted")
+        else:
+            report.count("scheme_catalog_entries", "dropped")
+            unused.append(code)
+    if unused:
+        report.notes.append(
+            f"scheme_catalog_entries without a document were not migrated: {', '.join(unused)}"
+        )
 
 
 def migrate_catalog_version(sq, conn, report: Report) -> None:
@@ -267,20 +285,49 @@ def migrate_catalog_version(sq, conn, report: Report) -> None:
     )
 
 
-def _ensure_doc_catalog_entry(conn, kind: str, code: str, name: str, aliases: list[str]) -> str:
-    conn.execute(
+def _instance_of(doc: sqlite3.Row) -> str:
+    return (_get(doc, "instance") or _default_instance()).strip().lower() or _default_instance()
+
+
+def _group_for(conn, instance: str) -> str:
+    """The ``groups`` row of a tenant code, created with a deterministic id."""
+    path = db._tenant_path(instance)
+    row = conn.execute(
         """
-        INSERT INTO catalog_entries (id, type, code, name, aliases, metadata)
-        VALUES (%s::uuid, %s, %s, %s, %s, %s) ON CONFLICT (type, code) DO NOTHING
+        INSERT INTO groups (id, name, path) VALUES (%s::uuid, %s, %s)
+        ON CONFLICT (path) DO UPDATE SET name = groups.name RETURNING id
         """,
-        (det_id("entry", f"{kind}:{code}"), kind, code, name or code, aliases,
-         Jsonb({"source": "pipeline"})),
-    )
-    return str(
-        conn.execute(
-            "SELECT id FROM catalog_entries WHERE type = %s AND code = %s", (kind, code)
-        ).fetchone()["id"]
-    )
+        (det_id("group", path), db._tenant_code_from_path(path), path),
+    ).fetchone()
+    return str(row["id"])
+
+
+def _catalog_for(conn, group_id: str, kind: str) -> str:
+    """The ``(group, kind)`` catalog, created with a deterministic id."""
+    catalog_type = catalog_type_for_kind(kind)
+    row = conn.execute(
+        """
+        INSERT INTO catalogs (id, group_id, type, name)
+        SELECT %s::uuid, g.id, %s, g.name || ' ' || %s FROM groups g WHERE g.id = %s::uuid
+        ON CONFLICT (group_id, type) DO UPDATE SET type = EXCLUDED.type RETURNING id
+        """,
+        (det_id("catalog", f"{group_id}:{catalog_type}"), catalog_type, kind, group_id),
+    ).fetchone()
+    return str(row["id"])
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:40].strip("-")
+
+
+def _unique_code(conn, catalog_id: str, base: str) -> str:
+    code, n = base, 1
+    while conn.execute(
+        "SELECT 1 FROM documents WHERE catalog_id = %s::uuid AND code = %s", (catalog_id, code)
+    ).fetchone():
+        n += 1
+        code = f"{base}-{n}"
+    return code
 
 
 # -----------------------------------------------------------------------------
@@ -393,7 +440,23 @@ def _build_workflows(
     return workflows, job_ids
 
 
-def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workflow: dict[str, list]) -> bool:
+def _skip_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workflow: dict[str, list], reason: str) -> None:
+    """Leave a document behind. Its history rows are counted as skipped; its audit
+    entries are kept, tied to the tenant's group but to no document."""
+    workflow_id = doc["workflow_id"]
+    report.skip("documents", workflow_id, reason)
+    for table in ("document_jobs", "document_artifacts", "pages", "chunks"):
+        report.count(table, "skipped", len(_rows(sq, table, "WHERE workflow_id = ?", (workflow_id,))))
+    for audit in audit_by_workflow.pop(workflow_id, []):
+        insert_audit(conn, audit, None, _instance_of(doc), report)
+
+
+def migrate_document(
+    sq, conn, doc: sqlite3.Row, report: Report, audit_by_workflow: dict[str, list],
+    registry: Optional[dict[str, dict[str, Any]]] = None, consumed: Optional[set[str]] = None,
+) -> bool:
+    registry = registry if registry is not None else {}
+    consumed = consumed if consumed is not None else set()
     workflow_id = doc["workflow_id"]
     doc_uuid = det_id("document", workflow_id)
     exists = conn.execute("SELECT 1 FROM documents WHERE id = %s::uuid", (doc_uuid,)).fetchone()
@@ -404,6 +467,14 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
             ("pages", "pages"), ("chunks", "chunks"),
         ):
             report.count(label, "existing", len(_rows(sq, table, "WHERE workflow_id = ?", (workflow_id,))))
+        return False
+
+    kind = (_get(doc, "document_kind") or "document").strip().lower()
+    if truthy(_get(doc, "is_demo")):
+        _skip_document(sq, conn, doc, report, audit_by_workflow, "demo document (is_demo)")
+        return False
+    if kind not in KIND_TO_CATALOG_TYPE:
+        _skip_document(sq, conn, doc, report, audit_by_workflow, f"document_kind {kind!r} has no catalog")
         return False
 
     fingerprint = next(
@@ -420,12 +491,7 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
         fingerprint = hashlib.md5((doc["document_id"] or workflow_id).encode()).hexdigest()
         report.notes.append(f"{workflow_id}: no hex fingerprint, derived md5 of document_id")
 
-    page_count = max(int(doc["page_count"] or 0), 0)
     chunk_rows = _rows(sq, "chunks", "WHERE workflow_id = ? ORDER BY chunk_number", (workflow_id,))
-    kind = (_get(doc, "document_kind") or "document").strip().lower()
-    if not _KIND_RE.match(kind):
-        report.notes.append(f"{workflow_id}: invalid document_kind {kind!r}, stored as 'document'")
-        kind = "document"
 
     chunking = None
     if chunk_rows:
@@ -436,24 +502,6 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
             model=_get(first, "chunking_model"),
             config=load_json(_get(first, "chunking_config_json"), {}),
         )
-    metadata = DocumentMetadata(
-        display_name=_get(doc, "display_name") or None,
-        catalog_visible=truthy(_get(doc, "catalog_visible"), True),
-        network_visible=truthy(_get(doc, "network_visible"), True),
-        is_demo=truthy(_get(doc, "is_demo")),
-        chunk_count=len(chunk_rows) if chunk_rows else max(int(doc["chunk_count"] or 0), 0),
-        reindex_required=truthy(_get(doc, "reindex_required")),
-        reindex_reason=_get(doc, "reindex_reason") or None,
-        chunking=chunking,
-    ).model_dump(exclude_none=True)
-    source = DocumentSource(
-        fingerprint=fingerprint,
-        original_filename=_get(doc, "source_filename") or doc["filename"],
-        storage_uri=doc["filepath"],
-        source_type=_get(doc, "source_type"),
-        canonical_input_type=_get(doc, "canonical_input_type"),
-        page_count=page_count,
-    ).model_dump(exclude_none=True)
 
     valid_from, valid_to = parse_date(_get(doc, "valid_from")), parse_date(_get(doc, "valid_to"))
     if valid_from and valid_to and valid_from > valid_to:
@@ -465,33 +513,58 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
         _get(doc, "uploaded_by_email"), _get(doc, "uploaded_by_roles"),
     )
 
-    entry_id = None
+    metadata = DocumentMetadata(
+        valid_from=valid_from.isoformat() if valid_from else None,
+        valid_to=valid_to.isoformat() if valid_to else None,
+        uploaded_by_user_id=uploader,
+        index_status=_build_index_status(sq, workflow_id),
+        catalog_visible=truthy(_get(doc, "catalog_visible"), True),
+        network_visible=truthy(_get(doc, "network_visible"), True),
+        reindex_required=truthy(_get(doc, "reindex_required")),
+        reindex_reason=_get(doc, "reindex_reason") or None,
+        chunking=chunking,
+    ).model_dump(exclude_none=True)
+    source = DocumentSource(
+        fingerprint=fingerprint,
+        original_filename=_get(doc, "source_filename") or doc["filename"],
+        storage_uri=doc["filepath"],
+        source_type=_get(doc, "source_type"),
+        canonical_input_type=_get(doc, "canonical_input_type"),
+    ).model_dump(exclude_none=True)
+
+    catalog_id = _catalog_for(conn, _group_for(conn, _instance_of(doc)), kind)
     code = (_get(doc, "scheme_code") or "").strip().lower()
-    if code and kind != "document":
-        if _CODE_RE.match(code):
-            aliases = [a for a in load_json(_get(doc, "scheme_aliases_json"), []) if isinstance(a, str) and a]
-            entry_id = _ensure_doc_catalog_entry(
-                conn, kind, code, _get(doc, "scheme_name") or code, aliases
-            )
-        else:
-            report.notes.append(f"{workflow_id}: scheme_code {code!r} is not a valid slug, not linked")
-    elif code:
-        report.notes.append(f"{workflow_id}: scheme_code {code!r} on a plain document, not linked")
+    entry = registry.get(code) if kind == "scheme" and code else None
+    if entry is not None:
+        consumed.add(code)
+    name = (entry or {}).get("name") or _get(doc, "scheme_name") or _get(doc, "display_name") or None
+    aliases = (entry or {}).get("aliases") or [
+        a for a in load_json(_get(doc, "scheme_aliases_json"), []) if isinstance(a, str) and a
+    ]
+    if code and not _CODE_RE.match(code):
+        report.notes.append(f"{workflow_id}: scheme_code {code!r} is not a valid slug, code derived")
+        code = ""
+    if not code:
+        code = _slug(name or "") or _slug(Path(doc["filename"] or "").stem)
+        if not _CODE_RE.match(code):
+            code = f"doc-{fingerprint[:8]}"
+        report.notes.append(f"{workflow_id}: no usable scheme_code, derived {code!r}")
+    unique = _unique_code(conn, catalog_id, code)
+    if unique != code:
+        report.notes.append(f"{workflow_id}: code {code!r} already used in its catalog, stored as {unique!r}")
+        code = unique
 
     created_at = parse_ts(doc["created_at"]) or datetime.now(timezone.utc)
     updated_at = parse_ts(doc["updated_at"]) or created_at
     conn.execute(
         """
-        INSERT INTO documents (id, instance, source, document_kind, catalog_entry_id, valid_from,
-                               valid_to, is_disabled, index_status, metadata, uploaded_by_user_id,
+        INSERT INTO documents (id, catalog_id, code, name, aliases, source, is_disabled, metadata,
                                created_at, updated_at)
-        VALUES (%s::uuid, %s, %s, %s, %s::uuid, %s, %s, %s, %s, %s, %s::uuid, %s, %s)
+        VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
-            doc_uuid, (_get(doc, "instance") or _default_instance()).strip().lower() or _default_instance(),
-            Jsonb(source), kind, entry_id, valid_from, valid_to, truthy(_get(doc, "is_disabled")),
-            Jsonb(_build_index_status(sq, workflow_id)), Jsonb(metadata), uploader, created_at,
-            updated_at,
+            doc_uuid, catalog_id, code, name or code, aliases, Jsonb(source),
+            truthy(_get(doc, "is_disabled")), Jsonb(metadata), created_at, updated_at,
         ),
     )
     report.count("documents", "inserted")
@@ -507,8 +580,8 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
             INSERT INTO workflows (id, document_id, workflow_type, temporal_workflow_id, status,
                                    current_stage, stage_timestamps, stop_after_ocr, error_message,
                                    config, started_by_user_id, started_at, completed_at, updated_at)
-            VALUES (%s::uuid, %s::uuid, %s::workflow_type_enum, %s, %s::workflow_status_enum,
-                    %s::workflow_stage, %s, %s, %s, %s, %s::uuid, %s, %s, %s)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s::uuid, %s, %s, %s)
             """,
             (
                 w["id"], doc_uuid, w["type"], w["temporal_id"], w["status"], w["stage"],
@@ -526,7 +599,7 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
             """
             INSERT INTO workflow_artifacts (id, workflow_id, artifact_type, stage, storage_uri,
                                             mime_type, filename, size_bytes, metadata, created_at)
-            VALUES (%s::uuid, %s::uuid, %s, %s::workflow_stage, %s, %s, %s, %s, %s, %s)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 det_id("artifact", f"{workflow_id}:{art['id']}"),
@@ -604,7 +677,7 @@ def migrate_document(sq, conn, doc: sqlite3.Row, report: Report, audit_by_workfl
         report.count("chunks", "inserted")
 
     for audit in audit_by_workflow.pop(workflow_id, []):
-        insert_audit(conn, audit, doc_uuid, source_instance=(_get(doc, "instance") or _default_instance()), report=report)
+        insert_audit(conn, audit, doc_uuid, source_instance=_instance_of(doc), report=report)
     return True
 
 
@@ -636,16 +709,16 @@ def insert_audit(conn, audit: sqlite3.Row, doc_uuid: Optional[str], source_insta
     )
     inserted = conn.execute(
         """
-        INSERT INTO audit_logs (id, document_id, workflow_id, instance, action_type, entity_type,
+        INSERT INTO audit_logs (id, document_id, workflow_id, group_id, action_type, entity_type,
                                 entity_number, field_name, old_value, new_value, metadata,
                                 actor_user_id, actor, created_at)
-        VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s::audit_entity_type, %s, %s, %s, %s, %s,
+        VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s, %s, %s, %s, %s, %s,
                 %s::uuid, %s, %s)
         ON CONFLICT (id) DO NOTHING RETURNING id
         """,
         (
             det_id("audit", str(audit["id"])), doc_uuid, workflow_id,
-            (source_instance or "").strip().lower() or None if doc_uuid else None,
+            _group_for(conn, source_instance.strip().lower()) if (source_instance or "").strip() else None,
             audit["action_type"], entity, audit["entity_id"],
             _legacy_audit_field(audit["field_name"], entity), audit["old_value"], audit["new_value"],
             Jsonb(metadata), actor_uuid,
@@ -794,13 +867,18 @@ def run_migration(sqlite_path: str, database_url: str, dry_run: bool = False) ->
                 else:
                     orphan_audit.append(audit)
 
-            with conn.transaction():
-                migrate_catalog_registry(sq, conn, report)
+            registry = load_catalog_registry(sq, report)
+            consumed: set[str] = set()
 
             for doc in documents:
                 report.count("documents", "read")
                 with conn.transaction():
-                    migrate_document(sq, conn, doc, report, audit_by_workflow)
+                    migrate_document(sq, conn, doc, report, audit_by_workflow, registry, consumed)
+            settle_catalog_registry(registry, consumed, report)
+
+            skipped = Counter(i["reason"] for i in report.skip_reasons if i["table"] == "documents")
+            for reason, n in sorted(skipped.items()):
+                report.notes.append(f"documents not migrated: {n} x {reason}")
 
             with conn.transaction():
                 for audits in audit_by_workflow.values():
