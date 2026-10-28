@@ -1139,6 +1139,28 @@ def reset_document_for_reupload(
         )
 
 
+def doc_id_used_by_other_document(doc_id: str, exclude_doc_uuid: Optional[str]) -> bool:
+    """True when a document other than ``exclude_doc_uuid`` uses ``doc_id`` as its index key.
+
+    The index key is the file fingerprint, so two documents holding the same file
+    share points in the vector index. Deleting a key another document still needs
+    would remove that document's vectors too.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM documents d
+            WHERE (%s::uuid IS NULL OR d.id <> %s::uuid)
+              AND (d.source->>'fingerprint' = %s
+                   OR EXISTS (SELECT 1 FROM jsonb_each(COALESCE(d.metadata->'index_status', '{}'::jsonb)) e
+                              WHERE e.value->>'doc_id' = %s))
+            LIMIT 1
+            """,
+            (exclude_doc_uuid, exclude_doc_uuid, doc_id, doc_id),
+        ).fetchone()
+    return row is not None
+
+
 def clear_superseded_doc_ids(workflow_id: str, env: str, doc_ids: list[str]) -> None:
     """Forget superseded index keys once their points are deleted from ``env`` (dev/prod)."""
     with get_connection() as conn:

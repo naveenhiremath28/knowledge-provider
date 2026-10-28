@@ -878,3 +878,24 @@ class TestSupersededPoints:
         )
 
         assert db_connection.get_document(doc_uuid)["superseded_doc_ids"] == {"dev": ["a" * 32]}
+
+    @pytest.mark.asyncio
+    @pytest.mark.db
+    @pytest.mark.unit
+    async def test_a_key_another_document_still_uses_is_kept_in_the_index(self, db_connection):
+        from pipeline import activities
+
+        doc_uuid = self._document(db_connection)
+        # A second document holds the very file the first one replaced.
+        db_connection.upsert_document(
+            workflow_id="wf-twin", document_id="a" * 32, filename="a.pdf",
+            filepath="minio://documents/a.pdf", group="gj", kind="scheme", code="twin",
+        )
+        store = self._Store()
+
+        await activities._drop_superseded_points(
+            "dev", "wf-sup-act", db_connection.get_document(doc_uuid), "c" * 32, "documents-index", store=store
+        )
+
+        assert store.calls == []
+        assert db_connection.get_document(doc_uuid)["superseded_doc_ids"] == {}

@@ -1288,3 +1288,27 @@ class TestUploadCatalogIdentity:
     def test_the_demo_and_bootstrap_routes_are_gone(self, test_client):
         assert test_client.post("/documents/anything/demo").status_code in (404, 405)
         assert test_client.post("/catalog/v1/bootstrap").status_code in (404, 405)
+
+
+class TestVectorKeysToDelete:
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_disable_never_deletes_a_key_another_document_uses(self, db_connection):
+        import pipeline.api as api
+
+        db = db_connection
+        uuid_a = db.upsert_document(
+            workflow_id="wf-k-a", document_id="a" * 32, filename="a.pdf",
+            filepath="minio://documents/a.pdf", group="mh", kind="scheme", code="k-a",
+        )
+        db.upsert_document(
+            workflow_id="wf-k-b", document_id="a" * 32, filename="a.pdf",
+            filepath="minio://documents/a.pdf", group="gj", kind="scheme", code="k-b",
+        )
+        db.upsert_document(
+            workflow_id="wf-k-c", document_id="b" * 32, filename="c.pdf",
+            filepath="minio://documents/c.pdf", group="mh", kind="scheme", code="k-c",
+        )
+
+        assert api._vector_doc_ids(db.get_document(uuid_a), "dev") == []
+        assert api._vector_doc_ids(db.get_document("wf-k-c"), "dev") == ["b" * 32]

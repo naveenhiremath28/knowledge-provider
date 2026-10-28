@@ -668,3 +668,28 @@ class TestSupersededIndexKeys:
         db.clear_superseded_doc_ids(doc_uuid, "dev", [first_key])
 
         assert db.get_document(doc_uuid)["superseded_doc_ids"] == {}
+
+
+class TestSharedIndexKeys:
+    """Two documents holding the same file share an index key; neither may delete it for the other."""
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_a_key_is_in_use_while_another_document_has_that_fingerprint(self, db_connection):
+        db = db_connection
+        first = _doc(db, "wf-twin-a", document_id="f" * 32)
+        _doc(db, "wf-twin-b", document_id="f" * 32, group="gj")
+
+        assert db.doc_id_used_by_other_document("f" * 32, first) is True
+        assert db.doc_id_used_by_other_document("0" * 32, first) is False
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_a_key_is_in_use_while_another_documents_index_entry_holds_it(self, db_connection):
+        db = db_connection
+        first = _doc(db, "wf-idx-a")
+        _doc(db, "wf-idx-b")
+        db.upsert_document_index_status("wf-idx-b", "documents-index", doc_id="9" * 32, status="indexed")
+
+        assert db.doc_id_used_by_other_document("9" * 32, first) is True
+        assert db.doc_id_used_by_other_document("9" * 32, db.get_document("wf-idx-b")["id"]) is False

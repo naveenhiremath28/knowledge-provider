@@ -1751,10 +1751,18 @@ def _require_catalog_read(request: Request, user: AuthUser) -> None:
 
 
 def _vector_doc_ids(doc: dict, env: str) -> list[str]:
-    """The document's current index key plus keys of earlier file versions still in ``env``."""
+    """Index keys to delete for a document: its current key plus keys of earlier file versions in ``env``.
+
+    A key another document also uses (the same file uploaded twice) is left
+    out, since deleting it would remove that document's vectors too.
+    """
     ids = [doc.get("document_id")]
     ids.extend((doc.get("superseded_doc_ids") or {}).get(env, []))
-    return list(dict.fromkeys(i for i in ids if i))
+    return [
+        i
+        for i in dict.fromkeys(i for i in ids if i)
+        if not db.doc_id_used_by_other_document(i, doc.get("id"))
+    ]
 
 
 def _delete_all_doc_ids(store, collection: str, doc_ids: list[str]) -> dict:
