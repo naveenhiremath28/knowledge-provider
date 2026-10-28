@@ -28,7 +28,7 @@ from .catalog_builder import normalize_document_kind
 from .chunking import chunk_pages, load_chunking_config
 from .discovery_publish_service import DiscoveryPublishService
 from .document_repository import DocumentRepository
-from .instances import instance_display_name, publish_to_network_enabled
+from .group_names import group_display_name, publish_to_network_enabled
 from .network_constants import RESULT_REJECTED
 from .ocr import ocr_pdf as run_ocr_pdf
 from .ocr import ocr_pdf_in_segments as run_ocr_pdf_in_segments
@@ -619,8 +619,8 @@ def clean_text_for_ingestion(text: str) -> str:
     return result.strip()
 
 
-def _normalize_instance(value: str | None) -> str:
-    """Ingest-side instance normalizer (mirrors auth.tenancy without importing FastAPI)."""
+def _normalize_group(value: str | None) -> str:
+    """Ingest-side group normalizer (mirrors auth.tenancy without importing FastAPI)."""
     text = (value or "").strip().lower()
     if text:
         return text
@@ -636,16 +636,16 @@ def _prepare_records(
     name_en: str | None = None,
     description: str | None = None,
     include_e5_prefix_field: bool = True,
-    instance: str | None = None,
-    document_kind: str = "document",
-    scheme_code: str | None = None,
-    scheme_name: str | None = None,
-    scheme_aliases: list[str] | None = None,
+    group: str | None = None,
+    kind: str = "document",
+    code: str | None = None,
+    name: str | None = None,
+    aliases: list[str] | None = None,
     valid_from: str | None = None,
     valid_to: str | None = None,
 ) -> list[dict]:
     metadata = _get_doc_metadata(filename)
-    resolved_instance = _normalize_instance(instance)
+    resolved_group = _normalize_group(group)
     llm_doc_description = _get_doc_description(filename)
 
     doc_hash = hashlib.md5(document_id.encode()).hexdigest()
@@ -661,19 +661,17 @@ def _prepare_records(
     short_description = metadata.get("doc_short_description", "")
     effective_description = description or llm_doc_description or short_description
 
-    kind = (document_kind or "document").strip().lower()
-    is_scheme = kind == "scheme" and bool((scheme_code or "").strip())
-    resolved_scheme_name = scheme_name or name_en or default_name
+    kind = (kind or "document").strip().lower()
+    is_scheme = kind == "scheme" and bool((code or "").strip())
+    resolved_name = name or name_en or default_name
     # Merge curator-supplied, bootstrap and derived aliases so a scheme is never
     # indexed with an empty alias list (it would then only match its exact name).
-    aliases = (
-        scheme_catalog.resolve_scheme_aliases(
-            scheme_code, resolved_scheme_name, scheme_aliases
-        )
+    resolved_aliases = (
+        scheme_catalog.resolve_scheme_aliases(code, resolved_name, aliases)
         if is_scheme
         else []
     )
-    instance_name = instance_display_name(resolved_instance)
+    group_name = group_display_name(resolved_group)
     # One period for the whole document, resolved before the loop: every chunk
     # of a document expires together, and re-deriving it per chunk would let a
     # midnight boundary split one document across two periods.
@@ -695,8 +693,8 @@ def _prepare_records(
             "_id": point_id,
             "doc_id": document_id,
             "workflow_id": workflow_id or "",
-            "instance": resolved_instance,
-            "instance_name": instance_name,
+            "instance": resolved_group,  # vector payload key, kept for consumers
+            "instance_name": group_name,
             "type": "scheme" if is_scheme else "document",
             "document_kind": kind,
             "source": "docs-pipeline",
@@ -731,9 +729,9 @@ def _prepare_records(
             if validity.end_date is not None:
                 record["end_date"] = validity.end_date
         if is_scheme:
-            record["scheme_code"] = (scheme_code or "").strip().lower()
-            record["scheme_name"] = resolved_scheme_name
-            record["scheme_aliases"] = aliases
+            record["scheme_code"] = (code or "").strip().lower()
+            record["scheme_name"] = resolved_name
+            record["scheme_aliases"] = resolved_aliases
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
         records.append(record)
@@ -742,26 +740,13 @@ def _prepare_records(
 
 
 def _scheme_fields_from_doc(doc: dict | None) -> dict:
-    """Extract scheme kwargs for _prepare_records from a documents row."""
-    import json as _json
-
+    """Extract kind/code/name/aliases kwargs for _prepare_records from a documents row."""
     doc = doc or {}
-    aliases_raw = doc.get("scheme_aliases_json")
-    aliases: list[str] = []
-    if isinstance(aliases_raw, list):
-        aliases = [str(a) for a in aliases_raw]
-    elif isinstance(aliases_raw, str) and aliases_raw.strip():
-        try:
-            parsed = _json.loads(aliases_raw)
-            if isinstance(parsed, list):
-                aliases = [str(a) for a in parsed]
-        except Exception:
-            aliases = []
     return {
-        "document_kind": (doc.get("document_kind") or "document"),
-        "scheme_code": doc.get("scheme_code"),
-        "scheme_name": doc.get("scheme_name"),
-        "scheme_aliases": aliases,
+        "kind": (doc.get("kind") or "document"),
+        "code": doc.get("code"),
+        "name": doc.get("name"),
+        "aliases": [str(a) for a in (doc.get("aliases") or [])],
     }
 
 
@@ -790,7 +775,7 @@ def prepare_ingestion_records(
     name_gu: str | None = None,
     name_en: str | None = None,
     description: str | None = None,
-    instance: str | None = None,
+    group: str | None = None,
 ) -> list[dict]:
     """Public helper used by tests and scripts when preparing vector-index payloads."""
     return _prepare_records(
@@ -801,7 +786,7 @@ def prepare_ingestion_records(
         name_gu=name_gu,
         name_en=name_en,
         description=description,
-        instance=instance,
+        group=group,
     )
 
 
@@ -1230,7 +1215,7 @@ async def prepare_for_ingestion(
         name_gu=name_gu,
         name_en=name_en,
         description=description,
-        instance=(doc or {}).get("instance"),
+        group=(doc or {}).get("group"),
         **_validity_fields_from_doc(doc),
     )
     activity.logger.info(f"Prepared {len(records)} records")
@@ -1304,8 +1289,8 @@ async def promote_document_to_prod_qdrant(
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id) or {}
     scheme_kwargs = _scheme_fields_from_doc(doc)
-    kind = (scheme_kwargs.get("document_kind") or "document").strip().lower()
-    is_scheme = kind == "scheme" and bool((scheme_kwargs.get("scheme_code") or "").strip())
+    kind = (scheme_kwargs.get("kind") or "document").strip().lower()
+    is_scheme = kind == "scheme" and bool((scheme_kwargs.get("code") or "").strip())
 
     if is_scheme:
         prod_url = (
@@ -1339,7 +1324,7 @@ async def promote_document_to_prod_qdrant(
         filename,
         chunks,
         workflow_id=workflow_id,
-        instance=doc.get("instance"),
+        group=doc.get("group"),
         **scheme_kwargs,
         **_validity_fields_from_doc(doc),
     )
@@ -1363,8 +1348,8 @@ async def promote_document_to_prod_qdrant(
             "collection": prod_collection,
             "records_ingested": result.get("records_ingested", len(records)),
             "prod_qdrant_url": prod_url,
-            "document_kind": kind,
-            "scheme_code": scheme_kwargs.get("scheme_code"),
+            "kind": kind,
+            "code": scheme_kwargs.get("code"),
         },
     )
     catalog_version = None
@@ -1402,7 +1387,7 @@ async def ingest_document_from_db(
         filename,
         chunks,
         workflow_id=workflow_id,
-        instance=doc.get("instance"),
+        group=doc.get("group"),
         **_scheme_fields_from_doc(doc),
         **_validity_fields_from_doc(doc),
     )
@@ -1477,7 +1462,7 @@ async def publish_catalog_to_network(workflow_id: str, transaction_id: str) -> d
         filename = "network_publish_skipped.json"
         exchange = {
             "skipped": True,
-            "document_kind": document_kind,
+            "kind": document_kind,
             "reason": skip_reason,
         }
     else:

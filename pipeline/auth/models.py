@@ -29,7 +29,7 @@ GLOBAL_READ_ROLES = frozenset(
 
 # Roles not limited by the JWT ``instances`` claim.
 # State-level roles are restricted to their claimed instances (tenants/states).
-INSTANCE_UNRESTRICTED_ROLES = SUPERADMIN_ROLES | GLOBAL_READ_ROLES
+GROUP_UNRESTRICTED_ROLES = SUPERADMIN_ROLES | GLOBAL_READ_ROLES
 
 
 @dataclass
@@ -73,44 +73,44 @@ class AuthUser:
         """
         return self.is_superadmin
 
-    def is_instance_unrestricted(self) -> bool:
-        """True when the caller may access every instance (all tenants/states).
+    def is_group_unrestricted(self) -> bool:
+        """True when the caller may access every group (all tenants/states).
 
         Two cases: local bypass mode with no scoped claim, or platform
         superadmin even when the token carries a narrow ``instances`` claim.
         """
         if self.token_disabled_mode and not self.instances:
             return True
-        return bool(INSTANCE_UNRESTRICTED_ROLES & self._role_keys)
+        return bool(GROUP_UNRESTRICTED_ROLES & self._role_keys)
 
-    def has_instance(self, instance: str) -> bool:
+    def has_group(self, group: str) -> bool:
         if not self.instances:
-            # Empty instance list means "no tenant restriction yet" only in disabled mode.
+            # Empty list means "no tenant restriction yet" only in disabled mode.
             return self.token_disabled_mode
-        return instance.strip().lower() in {i.lower() for i in self.instances}
+        return group.strip().lower() in {i.lower() for i in self.instances}
 
     def has_env(self, env: str) -> bool:
         if not self.envs:
             return self.token_disabled_mode
         return env.strip().lower() in {e.lower() for e in self.envs}
 
-    def role_for_instance(self, instance: str | None) -> str | None:
+    def role_for_group(self, group: str | None) -> str | None:
         """Role in a given state; super_admin always returns super_admin.
 
-        A ``bh_viewer`` reads every state, so any instance falls back to
+        A ``bh_viewer`` reads every state, so any group falls back to
         STATE_VIEW when no stronger per-state role is held.
         """
         if self.is_superadmin:
             return ROLE_SUPER_ADMIN
-        if not instance:
+        if not group:
             return None
-        role = self.state_roles.get(normalize_state_code(instance))
+        role = self.state_roles.get(normalize_state_code(group))
         if role:
             return role
         return ROLE_STATE_VIEW if self.is_bh_viewer else None
 
-    def has_permission_for_instance(
-        self, permission: Permission | str, instance: str | None
+    def has_permission_for_group(
+        self, permission: Permission | str, group: str | None
     ) -> bool:
         """Permission check scoped to a state when per-state roles are present.
 
@@ -126,7 +126,7 @@ class AuthUser:
         if not self.state_roles:
             return needed in self.permissions
 
-        role = self.role_for_instance(instance)
+        role = self.role_for_group(group)
         if not role:
             return False
         from .permissions import permissions_for_roles

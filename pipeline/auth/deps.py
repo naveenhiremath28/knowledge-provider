@@ -87,7 +87,10 @@ def _sync_user_row(user: AuthUser) -> None:
     if last is not None and now - last < _USER_SYNC_INTERVAL_SECONDS:
         return
     try:
-        db.upsert_user(user.user_id, user.username, user.email, user.roles)
+        db.upsert_user(
+            user.user_id, user.username, user.email, user.roles,
+            tenants=list(user.instances or []),
+        )
     except Exception:
         logging.warning("users upsert failed for %s", user.user_id, exc_info=True)
         return

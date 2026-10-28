@@ -217,17 +217,17 @@ def extract_groups_claim(claims: dict[str, Any]) -> list[str]:
     return []
 
 
-def role_for_instance(access: GroupAccess, instance: str | None) -> str | None:
-    """Return the user's role for a state instance, or SUPER_ADMIN when global.
+def role_for_group(access: GroupAccess, group: str | None) -> str | None:
+    """Return the user's role for a state group, or SUPER_ADMIN when global.
 
     A ``bh_viewer`` has no per-state group, but reads every state — so any
-    instance resolves to STATE_VIEW unless a stronger state role is held.
+    group resolves to STATE_VIEW unless a stronger state role is held.
     """
     if access.is_super_admin:
         return ROLE_SUPER_ADMIN
-    if not instance:
+    if not group:
         return None
-    role = access.state_roles.get(normalize_state_code(instance))
+    role = access.state_roles.get(normalize_state_code(group))
     if role:
         return role
     return ROLE_STATE_VIEW if access.is_bh_viewer else None

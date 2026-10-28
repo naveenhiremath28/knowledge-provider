@@ -45,11 +45,11 @@ class DiscoveryPublishService:
     def publish(
         self,
         transaction_id: str,
-        document_kind: Optional[str],
+        kind: Optional[str],
         workflow_id: Optional[str] = None,
     ) -> dict:
         """
-        POST a catalog/publish envelope for `document_kind`.
+        POST a catalog/publish envelope for `kind`.
 
         `transaction_id` is supplied by the caller (generated once per publish,
         reused across retries) - only `messageId` is generated fresh here, per
@@ -59,12 +59,12 @@ class DiscoveryPublishService:
         with `skipped=True`: the spec declares `message.catalogs` as
         `minItems: 1`, so there is no valid "publish nothing" request to send.
         """
-        catalog = build_catalog(document_kind)
+        catalog = build_catalog(kind)
         if catalog is None:
             logger.info(
-                "workflow_id=%s document_kind=%s network_publish_skipped=True",
+                "workflow_id=%s kind=%s network_publish_skipped=True",
                 workflow_id,
-                document_kind,
+                kind,
             )
             return {
                 "skipped": True,

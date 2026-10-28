@@ -28,7 +28,7 @@ from .groups import (
     group_leaf_for_role,
     normalize_role,
 )
-from .tenancy import PORTAL_INSTANCE
+from .tenancy import PORTAL_GROUP
 
 # Realm-role descriptions written when a role is auto-created.
 STATE_ROLE_DESCRIPTIONS: dict[str, str] = {
@@ -506,7 +506,7 @@ def provision_user(
         "roles": [r.get("name") for r in (roles or []) if isinstance(r, dict)],
         "app_url": ui_url,
         "login_url": login_url,
-        "portal_instance": PORTAL_INSTANCE,
+        "portal_group": PORTAL_GROUP,
         "share_message": "\n".join(share_lines),
     }
 
@@ -517,7 +517,7 @@ def list_access_options() -> dict[str, Any]:
     return {
         "keycloak_admin_configured": cfg.configured,
         "realm": cfg.realm,
-        "portal_instance": PORTAL_INSTANCE,
+        "portal_group": PORTAL_GROUP,
         "access_types": [
             {
                 "id": "super_admin",
@@ -579,9 +579,9 @@ def list_access_options() -> dict[str, Any]:
         "notes": [
             "Users sign in with Google SSO using the same email you enter.",
             "No app password is required for normal SSO login.",
-            "State codes must match document instance tags (mh, up, …).",
+            "State codes must match document group codes (mh, up, …).",
             "A centre is modelled as just another state code.",
-            "Super admin (BV) documents can use portal instance 'bv'.",
+            "Super admin (BV) documents can use portal group 'bv'.",
             "Access comes from group membership only — no direct role assignment.",
             "Keycloak groups: /global/super-admin, /global/bh-viewer, "
             "/states/{STATE}/{admin|approver|contributor|view}",

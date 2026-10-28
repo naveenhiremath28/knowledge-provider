@@ -71,15 +71,15 @@ from .auth.keycloak_admin import (
 from .auth.models import AuthUser
 from .auth.permissions import Permission
 from .auth.tenancy import (
-    PORTAL_INSTANCE,
-    allowed_instances,
-    assert_document_instance_access,
-    normalize_instance,
-    resolve_create_instance,
+    PORTAL_GROUP,
+    allowed_groups,
+    assert_document_group_access,
+    normalize_group,
+    resolve_create_group,
     unrestricted,
-    user_can_access_instance,
+    user_can_access_group,
 )
-from .instances import prod_stage_disabled, publish_to_network_enabled
+from .group_names import prod_stage_disabled, publish_to_network_enabled
 from .models import (
     PIPELINE_STAGES,
     PROD_ONLY_STAGES,
@@ -104,6 +104,7 @@ from .models import (
     SearchSettingsUpdate,
     SettingsAuditResponse,
 )
+from .network_constants import catalog_type_for_kind
 from .workflows import (
     ChunkingOnlyWorkflow,
     DocumentPipelineWorkflow,
@@ -145,7 +146,7 @@ async def lifespan(app: FastAPI):
     if auth_cfg.disabled:
         logging.warning(
             "WARNING: AUTH_DISABLED=true — every caller is treated as synthetic "
-            "master_admin with unrestricted instance access. Do not expose this "
+            "master_admin with unrestricted group access. Do not expose this "
             "API beyond the internal network or set AUTH_DISABLED=false until "
             "the maintainer UI sends Bearer tokens."
         )
@@ -372,15 +373,15 @@ def _compute_file_fingerprint(filepath: Path) -> str:
     return md5.hexdigest()
 
 
-def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
-    """None = unrestricted; otherwise only these instance ids."""
-    allowed = allowed_instances(user)
+def _group_scope_for_user(user: AuthUser) -> Optional[list[str]]:
+    """None = unrestricted; otherwise only these group codes."""
+    allowed = allowed_groups(user)
     if allowed is None:
         return None
     return sorted(allowed)
 
 
-def _document_cohorts_payload(summary: dict, by_instance: Optional[list[dict]] = None) -> dict:
+def _document_cohorts_payload(summary: dict, by_group: Optional[list[dict]] = None) -> dict:
     """Shape Postgres aggregate counts for DocumentCohortsResponse (all ints)."""
     def _i(key: str, default: int = 0) -> int:
         val = summary.get(key, default)
@@ -404,24 +405,61 @@ def _document_cohorts_payload(summary: dict, by_instance: Optional[list[dict]] =
             "ready_for_ingestion": _i("ready_for_ingestion_documents"),
             "failed": _i("failed_documents"),
         },
-        "by_instance": by_instance or [],
+        "by_group": by_group or [],
     }
 
 
-def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
-    """Plan 2: stamp document.instance from Keycloak-allowed states / portal."""
-    return resolve_create_instance(user, requested)
+def _resolve_create_group(user: AuthUser, requested: Optional[str] = None) -> str:
+    """Pick the document's group from Keycloak-allowed states / portal."""
+    return resolve_create_group(user, requested)
+
+
+def _document_title(filename: str) -> str:
+    """Human title for a new document: the file name without extension, separators as spaces."""
+    stem = Path(filename or "").stem
+    return re.sub(r"[_\-\s]+", " ", stem).strip() or "Untitled document"
+
+
+def _resolve_document_identity(
+    user: AuthUser,
+    group: str,
+    kind: str,
+    code: str,
+    filename: str,
+) -> tuple[str, str, Optional[dict]]:
+    """Kind, code and (when ``code`` already exists) the document an upload replaces.
+
+    An explicit ``code`` that is already held in the tenant's catalog of that
+    kind means "update this document": the caller reuses it instead of inserting.
+    Without a code one is derived from the file name.
+    """
+    kind = (kind or "").strip().lower()
+    try:
+        catalog_type_for_kind(kind)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    code = (code or "").strip()
+    if code:
+        try:
+            code = scheme_catalog.validate_scheme_code(code)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        existing = db.find_document_by_code(group, kind, code)
+        if existing:
+            existing = assert_document_group_access(user, existing)
+        return kind, code, existing
+    return kind, scheme_catalog.derive_scheme_code(_document_title(filename), kind=kind), None
 
 
 def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
-    """Load a document or 404 if missing / outside the caller's instance scope."""
-    return assert_document_instance_access(user, db.get_document(workflow_id))
+    """Load a document or 404 if missing / outside the caller's group scope."""
+    return assert_document_group_access(user, db.get_document(workflow_id))
 
 
 def _document_for_user_or_none(workflow_id: str, user: AuthUser) -> Optional[dict]:
     """Like _require_document_for_user but returns None instead of raising (bulk paths)."""
     doc = db.get_document(workflow_id)
-    if not doc or not user_can_access_instance(user, doc.get("instance")):
+    if not doc or not user_can_access_group(user, doc.get("group")):
         return None
     return doc
 
@@ -471,12 +509,12 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         canonical_document_id=doc.get("canonical_document_id"),
         workflow_id=doc["workflow_id"],
         filename=doc["filename"],
-        display_name=doc.get("display_name"),
+        name=doc.get("name"),
         source_filename=doc.get("source_filename"),
         source_manifest_name=doc.get("source_manifest_name"),
         source_file_fingerprint=doc.get("source_file_fingerprint"),
         authoritative=bool(doc.get("source_manifest_name")),
-        instance=normalize_instance(doc.get("instance")),
+        group=normalize_group(doc.get("group")),
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count") or 0,
         chunk_count=doc.get("chunk_count") or 0,
@@ -493,10 +531,9 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         uploaded_by_username=doc.get("uploaded_by_username"),
         uploaded_by_email=doc.get("uploaded_by_email"),
         uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
-        document_kind=(doc.get("document_kind") or "document"),
-        scheme_code=doc.get("scheme_code"),
-        scheme_name=doc.get("scheme_name"),
-        scheme_aliases=_parse_scheme_aliases(doc),
+        kind=doc.get("kind"),
+        code=doc.get("code"),
+        aliases=list(doc.get("aliases") or []),
         tool_routing=doc.get("tool_routing"),
         catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
@@ -873,8 +910,8 @@ async def auth_me(user: CurrentUser):
         "groups": list(user.groups or []),
         "state_roles": dict(user.state_roles or {}),
         "is_super_admin": bool(user.is_superadmin),
-        # Plan 2: portal instance code for BV / platform docs (not a state).
-        "portal_instance": PORTAL_INSTANCE,
+        # Portal group code for BV / platform docs (not a state).
+        "portal_group": PORTAL_GROUP,
         "auth_disabled": user.token_disabled_mode,
     }
 
@@ -979,10 +1016,16 @@ async def start_document_workflow(
     min_tokens: int = 100,
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
-    instance: str = "",
+    group: str = "",
+    kind: str = Query(..., description="scheme or advisory"),
+    code: str = "",
 ):
     """
     Start a new document processing workflow.
+
+    ``kind`` picks the tenant's catalog (scheme or advisory). ``code``
+    names the document in it; when that code already exists the existing
+    document is updated with the new file instead of a second one being created.
 
     The workflow will:
     1. Run OCR
@@ -995,10 +1038,13 @@ async def start_document_workflow(
     Rate limited to 10 requests/minute per IP.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
-    create_instance = _resolve_create_instance(user, instance)
+    create_group = _resolve_create_group(user, group)
     # Validate file path to prevent path traversal attacks
     filepath = validate_file_path(data.filepath)
     source_filename = get_filename_from_path(filepath)
+    doc_kind, doc_code, replace_doc = _resolve_document_identity(
+        user, create_group, kind, code, source_filename
+    )
     source_file_fingerprint = _compute_file_fingerprint(filepath)
     canonical_document_id = source_file_fingerprint
 
@@ -1010,7 +1056,7 @@ async def start_document_workflow(
     existing_doc = db.get_document(workflow_id)
     if existing_doc:
         # Same fingerprint/path must not leak or restart another tenant's doc.
-        existing_doc = assert_document_instance_access(user, existing_doc)
+        existing_doc = assert_document_group_access(user, existing_doc)
         try:
             handle = temporal_client.get_workflow_handle(workflow_id)
             state = await handle.query("get_state")
@@ -1023,7 +1069,7 @@ async def start_document_workflow(
                     source_filename=source_filename,
                     source_file_fingerprint=source_file_fingerprint,
                     authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
-                    instance=normalize_instance(existing_doc.get("instance")),
+                    group=normalize_group(existing_doc.get("group")),
                     stage=DocumentStage(state.get("stage", "registered")),
                     page_count=state.get("page_count", 0),
                     chunk_count=state.get("chunk_count", 0),
@@ -1061,25 +1107,40 @@ async def start_document_workflow(
     # that knows the upload day. A reviewer confirms or moves it later, on the
     # form that sets the document type.
     validity = document_validity.default_period()
-    document_uuid = db.upsert_document(
-        workflow_id=workflow_id,
-        document_id=document_id,
-        canonical_document_id=canonical_document_id,
-        filename=source_filename,
-        source_filename=source_filename,
-        source_file_fingerprint=source_file_fingerprint,
-        filepath=str(filepath),
-        stage="registered",
-        stop_after_ocr=stop_after_ocr,
-        instance=create_instance,
-        uploaded_by_user_id=actor.get("user_id") or None,
-        uploaded_by_username=actor.get("username") or None,
-        uploaded_by_email=actor.get("email") or None,
-        uploaded_by_roles=actor.get("roles_csv") or None,
-        valid_from=validity.start_date,
-        valid_to=validity.end_date,
-        with_workflow=False,
-    )
+    if replace_doc:
+        document_uuid = replace_doc["id"]
+        db.reset_document_for_reupload(
+            document_uuid,
+            filename=source_filename,
+            filepath=str(filepath),
+            fingerprint=source_file_fingerprint,
+        )
+    else:
+        try:
+            document_uuid = db.upsert_document(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                canonical_document_id=canonical_document_id,
+                filename=source_filename,
+                source_filename=source_filename,
+                source_file_fingerprint=source_file_fingerprint,
+                filepath=str(filepath),
+                stage="registered",
+                stop_after_ocr=stop_after_ocr,
+                group=create_group,
+                uploaded_by_user_id=actor.get("user_id") or None,
+                uploaded_by_username=actor.get("username") or None,
+                uploaded_by_email=actor.get("email") or None,
+                uploaded_by_roles=actor.get("roles_csv") or None,
+                valid_from=validity.start_date,
+                valid_to=validity.end_date,
+                with_workflow=False,
+                kind=doc_kind,
+                code=doc_code,
+                name=_document_title(source_filename),
+            )
+        except db.DuplicateDocumentCode as exc:
+            raise HTTPException(409, str(exc)) from exc
     db.create_document_job(
         workflow_id=document_uuid,
         job_type="ocr_only" if stop_after_ocr else "pipeline",
@@ -1103,7 +1164,13 @@ async def start_document_workflow(
         entity_type="document",
         field_name="registered",
         new_value=source_filename,
-        metadata={"source": "register_endpoint", "instance": create_instance},
+        metadata={
+            "source": "register_endpoint",
+            "group": create_group,
+            "kind": doc_kind,
+            "code": doc_code,
+            "replaced_existing": bool(replace_doc),
+        },
         user=user,
     )
 
@@ -1115,7 +1182,7 @@ async def start_document_workflow(
         source_filename=source_filename,
         source_file_fingerprint=source_file_fingerprint,
         authoritative=False,
-        instance=create_instance,
+        group=create_group,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0,
@@ -1138,17 +1205,26 @@ async def upload_and_process(
     min_tokens: int = 100,
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
-    instance: str = "",
+    group: str = "",
+    kind: str = Query(..., description="scheme or advisory"),
+    code: str = "",
 ):
     """
     Upload a supported file and start processing workflow.
+
+    ``kind`` picks the tenant's catalog (scheme or advisory). ``code``
+    names the document in it; when that code already exists the existing
+    document is updated with the new file instead of a second one being created.
 
     The file is stored in MinIO and then processed through the pipeline.
     Validates both file extension and PDF magic bytes for security.
     Rate limited to 10 requests/minute per IP.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
-    create_instance = _resolve_create_instance(user, instance)
+    create_group = _resolve_create_group(user, group)
+    doc_kind, doc_code, replace_doc = _resolve_document_identity(
+        user, create_group, kind, code, file.filename or ""
+    )
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
@@ -1188,7 +1264,7 @@ async def upload_and_process(
     # If Postgres was purged, avoid returning stale Temporal state and create a fresh run ID.
     existing_doc = db.get_document(workflow_id)
     if existing_doc:
-        existing_doc = assert_document_instance_access(user, existing_doc)
+        existing_doc = assert_document_group_access(user, existing_doc)
         try:
             handle = temporal_client.get_workflow_handle(workflow_id)
             state = await handle.query("get_state")
@@ -1201,7 +1277,7 @@ async def upload_and_process(
                     source_filename=file.filename,
                     source_file_fingerprint=file_hash,
                     authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
-                    instance=normalize_instance(existing_doc.get("instance")),
+                    group=normalize_group(existing_doc.get("group")),
                     stage=DocumentStage(state.get("stage", "registered")),
                     page_count=state.get("page_count", 0),
                     chunk_count=state.get("chunk_count", 0),
@@ -1237,25 +1313,40 @@ async def upload_and_process(
     actor = _actor_from_user(user)
     # See the manifest upload path above: the period starts at the upload.
     validity = document_validity.default_period()
-    document_uuid = db.upsert_document(
-        workflow_id=workflow_id,
-        document_id=document_id,
-        canonical_document_id=canonical_document_id,
-        filename=file.filename,
-        source_filename=file.filename,
-        source_file_fingerprint=file_hash,
-        filepath=minio_path,
-        stage="registered",
-        stop_after_ocr=stop_after_ocr,
-        instance=create_instance,
-        uploaded_by_user_id=actor.get("user_id") or None,
-        uploaded_by_username=actor.get("username") or None,
-        uploaded_by_email=actor.get("email") or None,
-        uploaded_by_roles=actor.get("roles_csv") or None,
-        valid_from=validity.start_date,
-        valid_to=validity.end_date,
-        with_workflow=False,
-    )
+    if replace_doc:
+        document_uuid = replace_doc["id"]
+        db.reset_document_for_reupload(
+            document_uuid,
+            filename=file.filename,
+            filepath=minio_path,
+            fingerprint=file_hash,
+        )
+    else:
+        try:
+            document_uuid = db.upsert_document(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                canonical_document_id=canonical_document_id,
+                filename=file.filename,
+                source_filename=file.filename,
+                source_file_fingerprint=file_hash,
+                filepath=minio_path,
+                stage="registered",
+                stop_after_ocr=stop_after_ocr,
+                group=create_group,
+                uploaded_by_user_id=actor.get("user_id") or None,
+                uploaded_by_username=actor.get("username") or None,
+                uploaded_by_email=actor.get("email") or None,
+                uploaded_by_roles=actor.get("roles_csv") or None,
+                valid_from=validity.start_date,
+                valid_to=validity.end_date,
+                with_workflow=False,
+                kind=doc_kind,
+                code=doc_code,
+                name=_document_title(file.filename or ""),
+            )
+        except db.DuplicateDocumentCode as exc:
+            raise HTTPException(409, str(exc)) from exc
     job_id = db.create_document_job(
         workflow_id=document_uuid,
         job_type="ocr_only" if stop_after_ocr else "pipeline",
@@ -1292,7 +1383,10 @@ async def upload_and_process(
         new_value=file.filename,
         metadata={
             "source": "upload_endpoint",
-            "instance": create_instance,
+            "group": create_group,
+            "kind": doc_kind,
+            "code": doc_code,
+            "replaced_existing": bool(replace_doc),
             "size_bytes": file_size,
             "auto_approve": auto_approve,
         },
@@ -1315,7 +1409,7 @@ async def upload_and_process(
         source_filename=file.filename,
         source_file_fingerprint=file_hash,
         authoritative=False,
-        instance=create_instance,
+        group=create_group,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0,
@@ -1337,10 +1431,11 @@ async def start_batch_workflows(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     stop_after_ocr: bool = False,
-    instance: str = "",
+    group: str = "",
+    kind: str = Query(..., description="scheme or advisory"),
 ):
     """Start workflows for all supported documents in a directory."""
-    create_instance = _resolve_create_instance(user, instance)
+    create_group = _resolve_create_group(user, group)
     directory = Path(data.directory)
     if not directory.exists():
         raise HTTPException(404, f"Directory not found: {data.directory}")
@@ -1361,7 +1456,9 @@ async def start_batch_workflows(
                 chunk_overlap=chunk_overlap,
                 min_tokens=min_tokens,
                 stop_after_ocr=stop_after_ocr,
-                instance=create_instance,
+                group=create_group,
+                kind=kind,
+                code="",
             )
             results.append(result)
         except Exception as e:
@@ -1387,23 +1484,20 @@ async def list_documents(
     stage: Optional[DocumentStage] = None,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
-    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
     """
     List all document workflows.
 
     Uses Postgres for fast listing (no Temporal queries for performance).
-    Demo documents are excluded by default - use X-Include-Demo: true header to show them.
     Disabled (soft-deleted) documents are excluded by default - use X-Include-Disabled: true to show them.
-    Results are limited to instances the caller can access.
+    Results are limited to groups the caller can access.
 
     Pagination:
     - limit: Max documents to return (default 100, max 500)
     - offset: Skip first N documents (default 0)
     """
     stage_filter = stage.value if stage else None
-    include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
 
     # Use Postgres only for fast listing - no Temporal queries
@@ -1411,9 +1505,8 @@ async def list_documents(
         stage=stage_filter,
         limit=limit,
         offset=offset,
-        include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=_instance_scope_for_user(user),
+        groups=_group_scope_for_user(user),
     )
 
     return [_document_summary_from_row(doc) for doc in docs]
@@ -1422,47 +1515,39 @@ async def list_documents(
 @app.get("/documents/summary", response_model=DocumentCohortsResponse)
 async def get_documents_summary(
     user: CurrentUser,
-    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
     """Return aggregate Postgres counts for dashboard totals and migration planning."""
-    include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
-    instance_scope = _instance_scope_for_user(user)
+    group_scope = _group_scope_for_user(user)
     summary = db.get_document_summary_counts(
-        include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=instance_scope,
+        groups=group_scope,
     )
-    by_instance = db.get_document_counts_by_instance(
-        include_demo=include_demo,
+    by_group = db.get_document_counts_by_group(
         include_disabled=include_disabled,
-        instances=instance_scope,
+        groups=group_scope,
     )
-    return _document_cohorts_payload(summary, by_instance)
+    return _document_cohorts_payload(summary, by_group)
 
 
 @app.get("/documents/cohorts", response_model=DocumentCohortsResponse)
 async def get_document_cohorts(
     user: CurrentUser,
-    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
     """Return machine-friendly cohort counts for queueing and orchestration."""
-    include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
-    instance_scope = _instance_scope_for_user(user)
+    group_scope = _group_scope_for_user(user)
     summary = db.get_document_summary_counts(
-        include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=instance_scope,
+        groups=group_scope,
     )
-    by_instance = db.get_document_counts_by_instance(
-        include_demo=include_demo,
+    by_group = db.get_document_counts_by_group(
         include_disabled=include_disabled,
-        instances=instance_scope,
+        groups=group_scope,
     )
-    return _document_cohorts_payload(summary, by_instance)
+    return _document_cohorts_payload(summary, by_group)
 
 
 @app.get("/operations/queue", response_model=OperationQueueResponse)
@@ -1470,22 +1555,19 @@ async def get_operations_queue(
     user: RequireSearch,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
-    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
 ):
     """Return documents that currently need operator or agent action.
 
-    Results are limited to instances the caller can access (state users never
+    Results are limited to groups the caller can access (state users never
     see portal ``bv`` or other states' documents).
     """
-    include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
     rows, total = db.list_operations_queue(
         limit=limit,
         offset=offset,
-        include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=_instance_scope_for_user(user),
+        groups=_group_scope_for_user(user),
     )
     items = [
         OperationQueueEntry(
@@ -1513,14 +1595,14 @@ async def list_runs(
 ):
     """List recent document jobs visible to the caller (tenant/role scoped).
 
-    Restricted users only see jobs whose document ``instance`` is in their
+    Restricted users only see jobs whose document ``group`` is in their
     allowed states. Super-admin / bypass users see all tenants.
     """
     return db.list_runs(
         limit=limit,
         offset=offset,
         status=status,
-        instances=_instance_scope_for_user(user),
+        groups=_group_scope_for_user(user),
     )
 
 
@@ -1530,17 +1612,13 @@ async def get_run(job_id: str, user: RequireSearch):
     run = db.get_document_job(job_id)
     if not run:
         raise HTTPException(404, f"Run not found: {job_id}")
-    # Enforce same instance scope as list: hide other tenants' runs as 404.
+    # Enforce same group scope as list: hide other tenants' runs as 404.
     workflow_id = run.get("workflow_id")
     if workflow_id:
         _require_document_for_user(str(workflow_id), user)
     elif not unrestricted(user):
         raise HTTPException(404, f"Run not found: {job_id}")
     return run
-
-
-def _parse_scheme_aliases(doc: dict) -> list[str]:
-    return scheme_catalog.parse_aliases(doc.get("scheme_aliases_json"))
 
 
 def _build_document_detail(doc: dict) -> DocumentDetail:
@@ -1552,12 +1630,12 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         canonical_document_id=doc.get("canonical_document_id"),
         workflow_id=workflow_id,
         filename=doc["filename"],
-        display_name=doc.get("display_name"),
+        name=doc.get("name"),
         source_filename=doc.get("source_filename"),
         source_manifest_name=doc.get("source_manifest_name"),
         source_file_fingerprint=doc.get("source_file_fingerprint"),
         authoritative=bool(doc.get("source_manifest_name")),
-        instance=normalize_instance(doc.get("instance")),
+        group=normalize_group(doc.get("group")),
         filepath=doc["filepath"],
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count", 0),
@@ -1586,10 +1664,9 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         uploaded_by_username=doc.get("uploaded_by_username"),
         uploaded_by_email=doc.get("uploaded_by_email"),
         uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
-        document_kind=(doc.get("document_kind") or "document"),
-        scheme_code=doc.get("scheme_code"),
-        scheme_name=doc.get("scheme_name"),
-        scheme_aliases=_parse_scheme_aliases(doc),
+        kind=doc.get("kind"),
+        code=doc.get("code"),
+        aliases=list(doc.get("aliases") or []),
         tool_routing=doc.get("tool_routing"),
         catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
@@ -2053,7 +2130,7 @@ async def disable_document(
     doc = _require_document_for_user(workflow_id, user)
 
     if not user.has_permission(Permission.ADMIN):
-        if not user.has_permission_for_instance(Permission.DELETE_OWN, doc.get("instance")):
+        if not user.has_permission_for_group(Permission.DELETE_OWN, doc.get("group")):
             raise HTTPException(403, "Missing permission: delete_own")
         if purge:
             raise HTTPException(
@@ -2110,13 +2187,13 @@ async def disable_document(
                 result["vector_error"] = vector_result["error"]
 
         # PROD Qdrant cleanup, if this document was ever promoted
-        kind = (doc.get("document_kind") or "document").strip().lower()
-        if kind == "scheme" or doc.get("scheme_code"):
+        kind = (doc.get("kind") or "").strip().lower()
+        if kind == "scheme":
             q_result = _delete_scheme_points_from_prod(doc)
             result["scheme_qdrant_deleted"] = q_result
             try:
                 result["catalog_version"] = scheme_catalog.on_scheme_document_disabled(
-                    workflow_id, scheme_code=doc.get("scheme_code")
+                    workflow_id, code=doc.get("code")
                 )
             except Exception as exc:
                 result["catalog_error"] = str(exc)
@@ -2138,7 +2215,7 @@ async def disable_document(
             entity_type="document",
             metadata={
                 "filename": doc.get("filename"),
-                "scheme_code": doc.get("scheme_code"),
+                "code": doc.get("code"),
                 "stage": doc.get("stage"),
                 "minio_artifacts_deleted": result["minio_artifacts_deleted"],
                 "keep_audit": keep_audit,
@@ -2159,7 +2236,7 @@ async def disable_document(
             "vector_deleted": result["vector_deleted"],
             "scheme_qdrant_deleted": result.get("scheme_qdrant_deleted"),
             "prod_qdrant_deleted": result.get("prod_qdrant_deleted"),
-            "scheme_code": doc.get("scheme_code"),
+            "code": doc.get("code"),
             "catalog_version": result.get("catalog_version"),
         },
         user=user,
@@ -2175,19 +2252,19 @@ async def patch_scheme_metadata(
     user: RequireReview,
 ):
     """
-    Set document_kind / scheme fields used by Master Catalog and Qdrant scheme promote.
+    Set kind / code / name / aliases used by Master Catalog and Qdrant scheme promote.
 
-    On completed docs, renaming scheme_code sets pending_reindex (excluded from live
+    On completed docs, renaming the code sets pending_reindex (excluded from live
     vector_schemes until re-promote). Other metadata edits bump catalog version only.
     """
     _require_document_for_user(workflow_id, user)
     try:
         result = scheme_catalog.apply_scheme_metadata(
             workflow_id,
-            document_kind=body.document_kind,
-            scheme_code=body.scheme_code,
-            scheme_name=body.scheme_name,
-            scheme_aliases=body.scheme_aliases,
+            kind=body.kind,
+            code=body.code,
+            name=body.name,
+            aliases=body.aliases,
             tool_routing=body.tool_routing,
             catalog_visible=body.catalog_visible,
             network_visible=body.network_visible,
@@ -2213,10 +2290,10 @@ async def patch_scheme_metadata(
     doc = result["document"]
     return {
         "workflow_id": workflow_id,
-        "document_kind": doc.get("document_kind"),
-        "scheme_code": doc.get("scheme_code"),
-        "scheme_name": doc.get("scheme_name"),
-        "scheme_aliases": scheme_catalog.parse_aliases(doc.get("scheme_aliases_json")),
+        "kind": doc.get("kind"),
+        "code": doc.get("code"),
+        "name": doc.get("name"),
+        "aliases": list(doc.get("aliases") or []),
         "tool_routing": doc.get("tool_routing"),
         "catalog_visible": bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         "network_visible": bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
@@ -2238,7 +2315,6 @@ async def patch_scheme_metadata(
 async def catalog_version(request: Request, user: CurrentUser):
     """Cheap poll for cache warmers: { version, updated_at }."""
     _require_catalog_read(request, user)
-    scheme_catalog.bootstrap_catalog_if_empty()
     meta = db.get_catalog_meta()
     return {
         "version": int(meta.get("version") or 0),
@@ -2258,7 +2334,6 @@ async def catalog_schemes(
 ):
     """List schemes from the master catalog (vector-indexed + filters)."""
     _require_catalog_read(request, user)
-    scheme_catalog.bootstrap_catalog_if_empty()
     snap = scheme_catalog.build_snapshot(
         instance=instance,
         status=status,
@@ -2290,7 +2365,6 @@ async def catalog_snapshot(
     collections metadata, and monotonic catalog_version.
     """
     _require_catalog_read(request, user)
-    scheme_catalog.bootstrap_catalog_if_empty()
     return scheme_catalog.build_snapshot(
         instance=instance,
         status=status,
@@ -2303,7 +2377,6 @@ async def catalog_snapshot(
 async def catalog_tool_prompt(request: Request, user: CurrentUser):
     """Prompt fragments only (for AI system prompt assembly)."""
     _require_catalog_read(request, user)
-    scheme_catalog.bootstrap_catalog_if_empty()
     snap = scheme_catalog.build_snapshot()
     return {
         "catalog_version": snap["catalog_version"],
@@ -2317,14 +2390,12 @@ async def catalog_tool_prompt(request: Request, user: CurrentUser):
 
 @app.post("/catalog/v1/rebuild")
 async def catalog_rebuild(request: Request, user: RequireAdmin):
-    """Admin: recompute catalog entries from documents + preserve bootstrap codes."""
+    """Admin: bump the catalog version (entries are computed from documents)."""
     from .auth.permissions import Permission
 
     # Admin JWT always OK; service key also accepted for automation
     if not _service_key_ok(request) and not user.has_permission(Permission.ADMIN):
         raise HTTPException(403, "Rebuild requires admin")
-    # Ensure bootstrap seeds exist before rebuild merge
-    scheme_catalog.bootstrap_catalog_if_empty()
     version = scheme_catalog.rebuild_catalog_from_documents(reason="admin_rebuild")
     snap = scheme_catalog.build_snapshot()
     _log_audit(
@@ -2340,13 +2411,6 @@ async def catalog_rebuild(request: Request, user: RequireAdmin):
         "vector_scheme_count": len(snap["vector_schemes"]),
         "updated_at": snap["updated_at"],
     }
-
-
-@app.post("/catalog/v1/bootstrap")
-async def catalog_bootstrap(request: Request, user: RequireAdmin, force: bool = Query(False)):
-    """Admin: seed 13 vector schemes if empty (or force=true)."""
-    result = scheme_catalog.bootstrap_catalog_if_empty(force=force)
-    return result
 
 
 @app.post("/documents/{workflow_id}/restore")
@@ -2391,24 +2455,6 @@ async def reingest_document(
     """
     # Get document from Postgres
     doc = _require_document_for_user(workflow_id, user)
-
-    # Reingest skips the entire review pipeline (including ready_for_ingestion,
-    # where document type / scheme name get set) and jumps straight to pushing
-    # chunks to Qdrant. That's fine for re-pushing already-classified content
-    # (e.g. after an embedding/index change), but a trap if it's used as a
-    # substitute for the real approval flow on a never-classified document —
-    # it would silently ingest with document_kind='document' and no scheme
-    # metadata, the exact raw-hash/filename-fallback catalog rows we've
-    # had to clean up by hand. 'document' is never offered as a choice in the
-    # classification panel, so seeing it here means classification was never done.
-    if (doc.get("document_kind") or "document") == "document" and not doc.get("scheme_code") and not doc.get("scheme_name"):
-        raise HTTPException(
-            400,
-            "This document has never been classified (document type / scheme name not set). "
-            "Set it via PATCH /documents/{workflow_id}/scheme-metadata (or the classification "
-            "panel at the ready_for_ingestion stage) before reingesting — reingest skips that "
-            "review stage entirely and would otherwise ingest with no scheme metadata.",
-        )
 
     # Get chunks from Postgres
     chunks = db.get_chunks(workflow_id, include_excluded=False)
@@ -2634,19 +2680,6 @@ async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
         "reindex_required": bool(updated.get("reindex_required")) if updated else False,
         "reindex_reason": updated.get("reindex_reason") if updated else None,
     }
-
-
-@app.post("/documents/{workflow_id}/demo")
-async def set_document_demo(workflow_id: str, user: RequireAdmin, is_demo: bool = Query(True)):
-    """
-    Mark a document as demo.
-
-    Demo documents are excluded from the UI by default but always available
-    for API testing via include_demo=true parameter.
-    """
-    _require_document_for_user(workflow_id, user)
-    db.set_document_demo(workflow_id, is_demo)
-    return {"workflow_id": workflow_id, "is_demo": is_demo}
 
 
 async def _reconcile_single_document(doc: dict) -> dict:
@@ -3225,14 +3258,14 @@ async def get_all_audit_logs(
 
     Each entry includes the document filename for context.
     """
-    scope = _instance_scope_for_user(user)
+    scope = _group_scope_for_user(user)
     logs = db.get_all_audit_logs(
         action_type=action_type,
         limit=limit,
         offset=offset,
-        instances=scope,
+        groups=scope,
     )
-    total = db.get_all_audit_log_count(action_type, instances=scope)
+    total = db.get_all_audit_log_count(action_type, groups=scope)
 
     return AuditLogResponse(
         logs=logs,
@@ -3466,14 +3499,14 @@ async def search_chunks_across_documents(
     stage: Optional[DocumentStage] = Query(None, description="Optional document stage filter"),
 ):
     """Search chunks across all documents for KB maintainer workflows."""
-    # Tenant-scope via the owning document's instance (None = unrestricted admin).
+    # Tenant-scope via the owning document's group (None = unrestricted admin).
     chunks, total = db.search_chunks(
         query=q,
         limit=limit,
         offset=offset,
         include_excluded=include_excluded,
         stage=stage.value if stage else None,
-        instances=_instance_scope_for_user(user),
+        groups=_group_scope_for_user(user),
     )
     return {
         "items": chunks,
@@ -3896,16 +3929,13 @@ async def get_vector_index_stats(index_name: str, user: RequireSearch):
 @app.get("/indexes/summary")
 async def get_vector_indexes_summary(
     user: RequireSearch,
-    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
 ):
     """Summarize index coverage from Postgres-backed index status plus live vector-store stats."""
     from .vector_store import get_vector_store
 
-    include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
     summaries = db.list_index_summaries(
-        include_demo=include_demo,
         include_disabled=include_disabled,
     )
     if not summaries:
@@ -4295,12 +4325,11 @@ async def reconcile_document_states(user: RequirePipeline):
         'ready_for_ingestion', 'ingesting'
     ]
 
-    # Scope to caller's instances (None = unrestricted bypass / all tenants).
+    # Scope to caller's groups (None = unrestricted bypass / all tenants).
     docs = db.list_documents(
         limit=1000,
-        include_demo=True,
         include_disabled=True,
-        instances=_instance_scope_for_user(user),
+        groups=_group_scope_for_user(user),
     )
     active_docs = [d for d in docs if d.get('stage') in active_stages]
 
