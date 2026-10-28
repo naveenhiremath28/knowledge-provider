@@ -1,11 +1,13 @@
-"""Instance (state / tenant) code → human-readable name.
+"""Group (state / tenant) code → human-readable name.
 
-``documents.instance`` stores a short lowercase code — ``bv`` for the Bharat
+A group code is a short lowercase ``groups.name`` — ``bv`` for the Bharat
 Vistaar portal, otherwise the state code matching the Keycloak group path
-(``/states/MH/...`` → ``mh``). That code is what the pipeline filters on, but
-it is not what a reader wants to see: consumers of the vector payload and the
-master catalog get ``instance_name`` alongside it so they can show "Maharashtra"
-without shipping their own lookup table.
+(``/states/MH/...`` → ``mh``). A document's group is derived through its
+catalog (``documents.catalog_id`` → ``catalogs.group_id``). That code is what
+the pipeline filters on, but it is not what a reader wants to see: consumers of
+the vector payload and the master catalog get ``instance_name`` (their field
+name, unchanged) alongside the code so they can show "Maharashtra" without
+shipping their own lookup table.
 
 Codes follow the standard two-letter Indian state/UT abbreviations. Unknown
 codes fall back to a title-cased version of the code itself rather than raising
@@ -17,7 +19,7 @@ from __future__ import annotations
 import os
 
 # Portal / platform-wide documents (not a state).
-PORTAL_INSTANCE = "bv"
+PORTAL_GROUP = "bv"
 
 
 def prod_stage_disabled() -> bool:
@@ -48,7 +50,7 @@ def publish_to_network_enabled() -> bool:
             in {"true", "1", "yes"})
 
 
-INSTANCE_NAMES: dict[str, str] = {
+GROUP_NAMES: dict[str, str] = {
     # Platform
     "bv": "Bharat Vistaar",
     "default": "Default",
@@ -96,15 +98,15 @@ INSTANCE_NAMES: dict[str, str] = {
 }
 
 
-def instance_display_name(code: str | None) -> str:
-    """Human-readable name for an instance code (``mh`` → ``Maharashtra``).
+def group_display_name(code: str | None) -> str:
+    """Human-readable name for a group code (``mh`` → ``Maharashtra``).
 
     Unknown codes are title-cased so the field is never empty.
     """
     normalized = (code or "").strip().lower()
     if not normalized:
-        return INSTANCE_NAMES["default"]
-    known = INSTANCE_NAMES.get(normalized)
+        return GROUP_NAMES["default"]
+    known = GROUP_NAMES.get(normalized)
     if known:
         return known
     # Unknown code: make it presentable rather than failing the ingest.

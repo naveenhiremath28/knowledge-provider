@@ -75,19 +75,19 @@ _KNOWLEDGE_KIND_CATALOGS = {
 PUBLISHABLE_DOCUMENT_KINDS = tuple(_KNOWLEDGE_KIND_CATALOGS)
 
 
-def normalize_document_kind(document_kind: Optional[str]) -> str:
-    """Coerce a stored `documents.document_kind` to its lookup form."""
-    return (document_kind or DEFAULT_DOCUMENT_KIND).strip().lower()
+def normalize_document_kind(kind: Optional[str]) -> str:
+    """Coerce a document's knowledge kind (from its catalog type) to its lookup form."""
+    return (kind or DEFAULT_DOCUMENT_KIND).strip().lower()
 
 
-def build_catalog(document_kind: Optional[str]) -> Optional[dict]:
-    """Return the catalog to announce for `document_kind`, or None.
+def build_catalog(kind: Optional[str]) -> Optional[dict]:
+    """Return the catalog to announce for `kind`, or None.
 
     None means this kind has nothing to announce - `document`, `video` and any
     operator-entered custom slug. Callers must skip the publish rather than send
     an empty `catalogs` array, which the spec rejects (`minItems: 1`).
     """
-    spec = _KNOWLEDGE_KIND_CATALOGS.get(normalize_document_kind(document_kind))
+    spec = _KNOWLEDGE_KIND_CATALOGS.get(normalize_document_kind(kind))
     if spec is None:
         return None
 

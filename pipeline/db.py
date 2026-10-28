@@ -41,6 +41,7 @@ from .models import (
     ResultSettings,
     RetrievalSettings,
 )
+from .network_constants import catalog_type_for_kind, kind_for_catalog_type
 
 logger = logging.getLogger(__name__)
 
@@ -136,13 +137,13 @@ PROD_INDEX_KEY = "prod"
 DEV_INDEX_KEY = "dev"
 
 
-def _default_instance() -> str:
+def _default_group() -> str:
     return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
 
 
-def _normalize_instances(instances: list[str]) -> list[str]:
-    default = _default_instance()
-    return sorted({(i or "").strip().lower() or default for i in instances})
+def _normalize_groups(groups: list[str]) -> list[str]:
+    default = _default_group()
+    return sorted({(i or "").strip().lower() or default for i in groups})
 
 
 def _iso_now() -> str:
@@ -245,7 +246,8 @@ def _resolve_document_uuid(conn, identifier: Optional[str]) -> Optional[str]:
         """
         SELECT id FROM documents d
         WHERE EXISTS (
-            SELECT 1 FROM jsonb_each(d.index_status) e WHERE e.value->>'doc_id' = %s
+            SELECT 1 FROM jsonb_each(COALESCE(d.metadata->'index_status', '{}'::jsonb)) e
+            WHERE e.value->>'doc_id' = %s
         ) OR md5(d.source->>'fingerprint') = %s
         ORDER BY created_at DESC LIMIT 1
         """,
@@ -267,15 +269,16 @@ def _require_document_uuid(conn, identifier: str) -> str:
 
 _DOC_SELECT = """
     SELECT
-        d.id, d.instance, d.source, d.document_kind, d.catalog_entry_id,
-        d.valid_from, d.valid_to, d.is_disabled, d.index_status, d.metadata,
+        d.id, d.catalog_id, d.code, d.name, d.aliases, d.source, d.is_disabled, d.metadata,
         d.created_at, d.updated_at,
+        c.type AS catalog_type, g.name AS group_name,
+        (SELECT count(*) FROM pages p WHERE p.document_id = d.id) AS page_total,
+        (SELECT count(*) FROM chunks ch WHERE ch.document_id = d.id) AS chunk_total,
         root.temporal_workflow_id AS root_workflow_id,
         root.stop_after_ocr AS root_stop_after_ocr,
         cw.id AS current_workflow_pk,
         cw.current_stage AS current_stage,
         cw.error_message AS current_error_message,
-        ce.code AS entry_code, ce.name AS entry_name, ce.aliases AS entry_aliases,
         u.keycloak_user_id AS up_user_id, u.username AS up_username,
         u.email AS up_email, u.roles AS up_roles,
         ts.ocr_completed_at, ts.translation_completed_at, ts.chunks_completed_at,
@@ -286,6 +289,8 @@ _DOC_SELECT = """
         oa.id AS original_artifact_id,
         na.id AS normalized_artifact_id
     FROM documents d
+    JOIN catalogs c ON c.id = d.catalog_id
+    JOIN groups g ON g.id = c.group_id
     LEFT JOIN document_current_workflow cw ON cw.document_id = d.id
     LEFT JOIN LATERAL (
         SELECT w.temporal_workflow_id, w.stop_after_ocr FROM workflows w
@@ -293,8 +298,7 @@ _DOC_SELECT = """
         ORDER BY (w.workflow_type IN ('pipeline', 'ocr_only')) DESC, w.started_at ASC, w.id ASC
         LIMIT 1
     ) root ON TRUE
-    LEFT JOIN catalog_entries ce ON ce.id = d.catalog_entry_id
-    LEFT JOIN users u ON u.id = d.uploaded_by_user_id
+    LEFT JOIN users u ON u.id = NULLIF(d.metadata->>'uploaded_by_user_id', '')::uuid
     LEFT JOIN LATERAL (
         SELECT min(w.stage_timestamps->>'ocr') AS ocr_completed_at,
                min(w.stage_timestamps->>'translation') AS translation_completed_at,
@@ -324,6 +328,16 @@ _DOC_SELECT = """
 """
 
 
+def _kind_of(catalog_type: Optional[str]) -> Optional[str]:
+    """Knowledge kind a catalog type stands for; an unmapped type is returned as is."""
+    if not catalog_type:
+        return None
+    try:
+        return kind_for_catalog_type(catalog_type)
+    except ValueError:
+        return catalog_type
+
+
 def _document_from_row(row: Optional[dict]) -> Optional[dict]:
     if row is None:
         return None
@@ -331,39 +345,37 @@ def _document_from_row(row: Optional[dict]) -> Optional[dict]:
     meta = row["metadata"] or {}
     fingerprint = source.get("fingerprint")
     roles = row["up_roles"] or []
-    entry_aliases = row["entry_aliases"]
+    entry_aliases = row["aliases"]
     doc = {
         "id": row["id"],
         "workflow_id": row["root_workflow_id"],
         "document_id": fingerprint,
         "canonical_document_id": fingerprint,
         "filename": source.get("original_filename") or "",
-        "display_name": meta.get("display_name"),
+        "name": row["name"],
         "source_filename": source.get("original_filename"),
         "source_manifest_name": None,
         "source_file_fingerprint": fingerprint,
         "filepath": source.get("storage_uri") or "",
-        "instance": row["instance"],
+        "group": (row["group_name"] or "").lower(),
         "stage": row["current_stage"] or "registered",
-        "page_count": source.get("page_count") or 0,
-        "chunk_count": meta.get("chunk_count") or 0,
+        "page_count": int(row["page_total"] or 0),
+        "chunk_count": int(row["chunk_total"] or 0),
         "error_message": row["current_error_message"],
-        "is_demo": bool(meta.get("is_demo")),
         "is_disabled": bool(row["is_disabled"]),
         "source_type": source.get("source_type"),
         "canonical_input_type": source.get("canonical_input_type"),
         "stop_after_ocr": bool(row["root_stop_after_ocr"]),
         "reindex_required": bool(meta.get("reindex_required")),
         "reindex_reason": meta.get("reindex_reason"),
-        "document_kind": row["document_kind"],
-        "scheme_code": row["entry_code"],
-        "scheme_name": row["entry_name"],
-        "scheme_aliases_json": json.dumps(list(entry_aliases)) if entry_aliases is not None else None,
-        "tool_routing": "qdrant" if row["entry_code"] else None,
+        "kind": _kind_of(row["catalog_type"]),
+        "code": row["code"],
+        "aliases": list(entry_aliases or []),
+        "tool_routing": "qdrant",
         "catalog_visible": bool(meta.get("catalog_visible", True)),
         "network_visible": bool(meta.get("network_visible", True)),
-        "valid_from": row["valid_from"],
-        "valid_to": row["valid_to"],
+        "valid_from": meta.get("valid_from"),
+        "valid_to": meta.get("valid_to"),
         "uploaded_by_user_id": row["up_user_id"],
         "uploaded_by_username": row["up_username"],
         "uploaded_by_email": row["up_email"],
@@ -378,8 +390,8 @@ def _document_from_row(row: Optional[dict]) -> Optional[dict]:
         "original_artifact_id": row["original_artifact_id"],
         "normalized_artifact_id": row["normalized_artifact_id"],
         "latest_job_id": row["current_workflow_pk"],
-        "catalog_entry_id": row["catalog_entry_id"],
-        "index_status": row["index_status"] or {},
+        "catalog_id": row["catalog_id"],
+        "index_status": meta.get("index_status") or {},
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -394,21 +406,78 @@ def _fetch_document(conn, doc_uuid: Optional[str]) -> Optional[dict]:
 
 
 def _document_filters(
-    include_demo: bool,
     include_disabled: bool,
-    instances: Optional[list[str]],
+    groups: Optional[list[str]],
     alias: str = "d",
+    group_alias: str = "g",
 ) -> tuple[list[str], list]:
+    """WHERE clauses for document lists. The query must join ``groups`` as ``group_alias``."""
     clauses: list[str] = []
     params: list = []
-    if not include_demo:
-        clauses.append(f"NOT COALESCE(({alias}.metadata->>'is_demo')::boolean, FALSE)")
     if not include_disabled:
         clauses.append(f"NOT {alias}.is_disabled")
-    if instances is not None:
-        clauses.append(f"lower({alias}.instance) = ANY(%s)")
-        params.append(_normalize_instances(instances))
+    if groups is not None:
+        clauses.append(f"lower({group_alias}.name) = ANY(%s)")
+        params.append(_normalize_groups(groups))
     return clauses, params
+
+
+# =============================================================================
+# Groups
+# =============================================================================
+
+def _tenant_path(group: str) -> str:
+    """Keycloak group path of a tenant code: ``bv`` is ``/global``, others ``/states/<CODE>``."""
+    return "/global" if group == "bv" else f"/states/{group.upper()}"
+
+
+def _tenant_code_from_path(path: str) -> str:
+    return "bv" if path == "/global" else path.rstrip("/").rsplit("/", 1)[-1].lower()
+
+
+def upsert_group(path: str, keycloak_group_id: Optional[str] = None, conn=None) -> str:
+    """Create or refresh the ``groups`` row for a Keycloak group path; returns its UUID.
+
+    Rows made by the SQLite move have no Keycloak id yet; the first sync that
+    sees the path fills it in.
+    """
+    if conn is None:
+        with get_connection() as own:
+            return upsert_group(path, keycloak_group_id, conn=own)
+    row = conn.execute(
+        """
+        INSERT INTO groups (keycloak_group_id, name, path) VALUES (%s, %s, %s)
+        ON CONFLICT (path) DO UPDATE SET
+            keycloak_group_id = COALESCE(EXCLUDED.keycloak_group_id, groups.keycloak_group_id)
+        RETURNING id
+        """,
+        (keycloak_group_id, _tenant_code_from_path(path), path),
+    ).fetchone()
+    return str(row["id"])
+
+
+def get_or_create_group(group: Optional[str], conn=None) -> str:
+    """UUID of the group for a tenant code (``bv``, ``mh``, ...), created when missing."""
+    code = (group or _default_group()).strip().lower() or _default_group()
+    return upsert_group(_tenant_path(code), conn=conn)
+
+
+def get_or_create_catalog(group_id: str, kind: str, conn=None) -> dict:
+    """The ``(group, kind)`` catalog row, created with a default name when missing."""
+    if conn is None:
+        with get_connection() as own:
+            return get_or_create_catalog(group_id, kind, conn=own)
+    catalog_type = catalog_type_for_kind(kind)
+    row = conn.execute(
+        """
+        INSERT INTO catalogs (group_id, type, name)
+        SELECT g.id, %s, g.name || ' ' || %s FROM groups g WHERE g.id = %s::uuid
+        ON CONFLICT (group_id, type) DO UPDATE SET type = EXCLUDED.type
+        RETURNING id, group_id, type, name, metadata
+        """,
+        (catalog_type, kind, group_id),
+    ).fetchone()
+    return _clean_row(row)
 
 
 # =============================================================================
@@ -421,16 +490,29 @@ def upsert_user(
     email: Optional[str] = None,
     roles: Any = None,
     conn=None,
+    tenants: Optional[list[str]] = None,
 ) -> Optional[str]:
-    """Create or refresh the ``users`` row for a Keycloak subject; returns its UUID."""
+    """Create or refresh the ``users`` row for a Keycloak subject; returns its UUID.
+
+    ``tenants`` are the tenant codes in the user's token. A user has one
+    ``group_id``, so the first code (sorted) wins and a warning is logged when
+    there are several. Authorization still reads the token, not this column.
+    """
     keycloak_user_id = (keycloak_user_id or "").strip()
     if not keycloak_user_id:
         return None
     if conn is None:
         with get_connection() as own:
-            return upsert_user(keycloak_user_id, username, email, roles, conn=own)
+            return upsert_user(keycloak_user_id, username, email, roles, conn=own, tenants=tenants)
 
     role_list = _csv_roles(roles)
+    tenant_codes = sorted({(t or "").strip().lower() for t in (tenants or []) if (t or "").strip()})
+    if len(tenant_codes) > 1:
+        logger.warning(
+            "user %s has several tenants %s; users.group_id uses %s",
+            keycloak_user_id, tenant_codes, tenant_codes[0],
+        )
+    group_uuid = get_or_create_group(tenant_codes[0], conn=conn) if tenant_codes else None
     email = (email or "").strip() or None
     username = (username or "").strip() or None
     for candidate_email in ([email, None] if email else [None]):
@@ -438,17 +520,18 @@ def upsert_user(
             with conn.transaction():
                 row = conn.execute(
                     """
-                    INSERT INTO users (keycloak_user_id, username, email, roles)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO users (keycloak_user_id, username, email, roles, group_id)
+                    VALUES (%s, %s, %s, %s, %s::uuid)
                     ON CONFLICT (keycloak_user_id) DO UPDATE SET
                         username = COALESCE(EXCLUDED.username, users.username),
                         email = COALESCE(EXCLUDED.email, users.email),
                         roles = CASE WHEN cardinality(EXCLUDED.roles) > 0
                                      THEN EXCLUDED.roles ELSE users.roles END,
+                        group_id = COALESCE(EXCLUDED.group_id, users.group_id),
                         last_seen_at = now()
                     RETURNING id
                     """,
-                    (keycloak_user_id, username, candidate_email, role_list),
+                    (keycloak_user_id, username, candidate_email, role_list, group_uuid),
                 ).fetchone()
             return str(row["id"])
         except psycopg.errors.UniqueViolation:
@@ -742,100 +825,65 @@ def bump_catalog_version(reason: str = "") -> int:
     return int(row["version"])
 
 
-def upsert_catalog_entry(
-    *,
-    type: str,
-    code: str,
-    name: Optional[str] = None,
-    aliases: Optional[list[str]] = None,
-    source: Optional[str] = None,
-    conn=None,
-) -> dict:
-    """Insert or update one ``catalog_entries`` row. ``None`` fields keep stored values."""
-    if conn is None:
-        with get_connection() as own:
-            return upsert_catalog_entry(
-                type=type, code=code, name=name, aliases=aliases, source=source, conn=own
-            )
-    alias_list = [a for a in (aliases or []) if a] if aliases is not None else None
-    row = conn.execute(
-        """
-        INSERT INTO catalog_entries (type, code, name, aliases, metadata)
-        VALUES (%s, %s, COALESCE(%s, %s), COALESCE(%s, '{}'::text[]), %s)
-        ON CONFLICT (type, code) DO UPDATE SET
-            name = COALESCE(%s, catalog_entries.name),
-            aliases = COALESCE(%s, catalog_entries.aliases),
-            metadata = CASE WHEN %s::text IS NULL THEN catalog_entries.metadata
-                            ELSE catalog_entries.metadata || jsonb_build_object('source', %s::text) END
-        RETURNING id, type, code, name, aliases, metadata
-        """,
-        (
-            type, code, name, code, alias_list, Jsonb({"source": source or "pipeline"}),
-            name, alias_list, source, source,
-        ),
-    ).fetchone()
-    return _clean_row(row)
-
-
-def list_catalog_entry_codes(type: str) -> set[str]:
+def list_document_codes(kind: str) -> set[str]:
+    """Every document code in catalogs of one knowledge kind."""
     with get_connection() as conn:
-        rows = conn.execute("SELECT code FROM catalog_entries WHERE type = %s", (type,)).fetchall()
+        rows = conn.execute(
+            "SELECT d.code FROM documents d JOIN catalogs c ON c.id = d.catalog_id WHERE c.type = %s",
+            (catalog_type_for_kind(kind),),
+        ).fetchall()
     return {r["code"] for r in rows}
 
 
 def _catalog_row(row: dict) -> dict:
     cleaned = _clean_row(row)
+    cleaned.pop("group_name", None)
     cleaned["aliases"] = list(row["aliases"] or [])
-    cleaned["instances"] = list(row["instances"] or [])
-    cleaned["workflow_ids"] = list(row["workflow_ids"] or [])
+    cleaned["groups"] = [(row["group_name"] or "").lower()]
+    cleaned["workflow_ids"] = [row["workflow_id"]] if row["workflow_id"] else []
+    cleaned["source"] = "pipeline"
     return cleaned
 
 
-def list_catalog_entries(status: Optional[str] = None, type: str = "scheme") -> list[dict]:
-    """Rows of the ``catalog`` view for one entry type."""
+def list_catalog_entries(status: Optional[str] = None, kind: str = "scheme") -> list[dict]:
+    """Rows of the ``catalog_status`` view (one per document) for one knowledge kind."""
+    catalog_type = catalog_type_for_kind(kind)
     with get_connection() as conn:
         if status:
             rows = conn.execute(
-                "SELECT * FROM catalog WHERE type = %s AND status = %s ORDER BY code",
-                (type, status),
+                "SELECT * FROM catalog_status WHERE type = %s AND status = %s ORDER BY code",
+                (catalog_type, status),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM catalog WHERE type = %s ORDER BY code", (type,)
+                "SELECT * FROM catalog_status WHERE type = %s ORDER BY code", (catalog_type,)
             ).fetchall()
     return [_catalog_row(r) for r in rows]
 
 
-def get_catalog_entry(code: str, type: str = "scheme") -> Optional[dict]:
+def get_catalog_entry(code: str, kind: str = "scheme") -> Optional[dict]:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM catalog WHERE type = %s AND code = %s", (type, code)
+            "SELECT * FROM catalog_status WHERE type = %s AND code = %s LIMIT 1",
+            (catalog_type_for_kind(kind), code),
         ).fetchone()
     return _catalog_row(row) if row else None
 
 
-def list_used_scheme_codes(exclude_workflow_id: Optional[str] = None) -> set[str]:
-    """Every scheme code already taken - the collision domain for auto-generated codes.
+def list_used_scheme_codes(exclude_workflow_id: Optional[str] = None, kind: str = "scheme") -> set[str]:
+    """Every document code already taken in a kind - the collision domain for auto-generated codes.
 
-    The entry the excluded document alone holds is not counted, so re-deriving a
-    document's own code does not collide with itself.
+    The excluded document's own code is not counted, so re-deriving a
+    document's code does not collide with itself.
     """
     with get_connection() as conn:
         doc_uuid = _resolve_document_uuid(conn, exclude_workflow_id) if exclude_workflow_id else None
         rows = conn.execute(
             """
-            SELECT e.code FROM catalog_entries e
-            WHERE e.type = 'scheme'
-              AND NOT (
-                  %s::uuid IS NOT NULL
-                  AND e.metadata->>'source' <> 'bootstrap'
-                  AND EXISTS (SELECT 1 FROM documents d
-                              WHERE d.catalog_entry_id = e.id AND d.id = %s::uuid)
-                  AND NOT EXISTS (SELECT 1 FROM documents d
-                                  WHERE d.catalog_entry_id = e.id AND d.id <> %s::uuid)
-              )
+            SELECT d.code FROM documents d JOIN catalogs c ON c.id = d.catalog_id
+            WHERE c.type = %s AND (%s::uuid IS NULL OR d.id <> %s::uuid)
             """,
-            (doc_uuid, doc_uuid, doc_uuid),
+            (catalog_type_for_kind(kind), doc_uuid, doc_uuid),
         ).fetchall()
     return {r["code"] for r in rows}
 
@@ -844,59 +892,30 @@ def list_scheme_catalog_entries_for_workflow(workflow_id: str) -> list[dict]:
     """Catalog rows whose documents still include this workflow."""
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT code, workflow_ids FROM catalog WHERE type = 'scheme' AND %s = ANY(workflow_ids)",
-            (workflow_id,),
+            "SELECT code, workflow_id FROM catalog_status WHERE type = %s AND workflow_id = %s",
+            (catalog_type_for_kind("scheme"), workflow_id),
         ).fetchall()
-    return [{"scheme_code": r["code"], "workflow_ids": list(r["workflow_ids"])} for r in rows]
+    return [{"code": r["code"], "workflow_ids": [r["workflow_id"]]} for r in rows]
 
 
-def _link_catalog_entry(
-    conn,
-    doc_uuid: str,
-    updates: dict,
-) -> dict[str, Any]:
-    """Resolve document_kind / scheme_* updates into documents column changes.
+def find_document_by_code(group: str, kind: str, code: str) -> Optional[dict]:
+    """The document holding ``code`` in the group's ``kind`` catalog, if any."""
+    tenant = (group or _default_group()).strip().lower() or _default_group()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT d.id FROM documents d
+            JOIN catalogs c ON c.id = d.catalog_id
+            JOIN groups g ON g.id = c.group_id
+            WHERE lower(g.name) = %s AND c.type = %s AND d.code = %s
+            """,
+            (tenant, catalog_type_for_kind(kind), code),
+        ).fetchone()
+        return _fetch_document(conn, str(row["id"])) if row else None
 
-    Returns the extra ``documents`` assignments (``document_kind``,
-    ``catalog_entry_id``) so the kind and its entry change in one statement,
-    which the composite foreign key requires.
-    """
-    current = conn.execute(
-        """
-        SELECT d.document_kind, d.catalog_entry_id, ce.type AS entry_type,
-               ce.code AS entry_code, ce.name AS entry_name, ce.aliases AS entry_aliases
-        FROM documents d LEFT JOIN catalog_entries ce ON ce.id = d.catalog_entry_id
-        WHERE d.id = %s::uuid
-        """,
-        (doc_uuid,),
-    ).fetchone()
-    kind = updates.get("document_kind") or current["document_kind"]
-    code = updates["scheme_code"] if "scheme_code" in updates else current["entry_code"]
-    name = updates["scheme_name"] if "scheme_name" in updates else None
-    aliases = None
-    if "scheme_aliases_json" in updates:
-        raw = updates["scheme_aliases_json"]
-        aliases = json.loads(raw) if isinstance(raw, str) else list(raw or [])
 
-    changes: dict[str, Any] = {}
-    if "document_kind" in updates:
-        changes["document_kind"] = kind
-
-    current_entry_id = str(current["catalog_entry_id"]) if current["catalog_entry_id"] else None
-    new_entry_id = None
-    if kind != "document" and code:
-        moved = current["entry_type"] != kind or current["entry_code"] != code
-        if moved:
-            if name is None:
-                name = current["entry_name"]
-            if aliases is None and current["entry_aliases"] is not None:
-                aliases = list(current["entry_aliases"])
-        new_entry_id = upsert_catalog_entry(
-            type=kind, code=code, name=name, aliases=aliases, source="pipeline", conn=conn
-        )["id"]
-    if new_entry_id != current_entry_id:
-        changes["catalog_entry_id"] = new_entry_id
-    return changes
+class DuplicateDocumentCode(ValueError):
+    """The ``(catalog, code)`` pair is already held by another document."""
 
 
 # =============================================================================
@@ -909,7 +928,7 @@ def upsert_document(
     filename: str,
     filepath: str,
     canonical_document_id: Optional[str] = None,
-    display_name: Optional[str] = None,
+    name: Optional[str] = None,
     source_filename: Optional[str] = None,
     source_manifest_name: Optional[str] = None,
     source_file_fingerprint: Optional[str] = None,
@@ -927,7 +946,7 @@ def upsert_document(
     original_artifact_id: Optional[str] = None,
     normalized_artifact_id: Optional[str] = None,
     latest_job_id: Optional[str] = None,
-    instance: Optional[str] = None,
+    group: Optional[str] = None,
     uploaded_by_user_id: Optional[str] = None,
     uploaded_by_username: Optional[str] = None,
     uploaded_by_email: Optional[str] = None,
@@ -935,11 +954,20 @@ def upsert_document(
     valid_from: Optional[str] = None,
     valid_to: Optional[str] = None,
     with_workflow: bool = True,
+    kind: Optional[str] = None,
+    code: Optional[str] = None,
+    aliases: Optional[list[str]] = None,
 ) -> str:
     """Insert or update a document record; returns the document UUID.
 
-    ``instance`` is applied on INSERT only. Updates leave the existing tenant
-    stamp alone so a re-upload / restart cannot silently reassign tenants.
+    A new document needs ``kind`` (``scheme`` / ``advisory``) and ``code``:
+    ``group`` (a tenant code) and the kind pick its ``(group, kind)`` catalog,
+    which is created when missing. ``name`` becomes ``documents.name`` (the
+    code when absent). ``DuplicateDocumentCode`` is raised when another
+    document already holds ``code`` in that catalog.
+
+    ``group`` and the catalog are applied on INSERT only. Updates leave them
+    alone so a re-upload / restart cannot silently reassign tenants.
     Uploader identity is set on INSERT, and filled on UPDATE only when currently null.
 
     ``valid_from``/``valid_to`` are the document's validity period, stored as
@@ -948,12 +976,15 @@ def upsert_document(
     to is the caller's call (see ``pipeline/document_validity.py``); omitting
     both stores NULL, which search reads as "no stated period".
 
+    ``page_count`` and ``chunk_count`` are accepted for call-site compatibility
+    and ignored: both are counted from ``pages`` and ``chunks``.
+
     A new document also gets its first workflow row (``temporal_workflow_id`` =
     ``workflow_id``) unless ``with_workflow`` is False, for callers that create
     it themselves with ``create_document_job`` (addressing the document by the
     returned UUID, since no workflow id resolves to it yet).
     """
-    instance_value = (instance or _default_instance()).strip().lower() or _default_instance()
+    group_value = (group or _default_group()).strip().lower() or _default_group()
     fingerprint = _fingerprint_for(
         source_file_fingerprint or canonical_document_id, document_id, workflow_id
     )
@@ -963,30 +994,29 @@ def upsert_document(
         "storage_uri": filepath,
         "source_type": source_type,
         "canonical_input_type": canonical_input_type,
-        "page_count": page_count,
     }
     with get_connection() as conn:
         doc_uuid = _resolve_document_uuid(conn, workflow_id) if workflow_id else None
         if doc_uuid:
             patch = {k: v for k, v in source_patch.items() if v is not None}
             DocumentSource.model_validate({**_load(conn, doc_uuid, "source"), **patch})
-            metadata_patch: dict[str, Any] = {"chunk_count": chunk_count}
-            if display_name:
-                metadata_patch["display_name"] = display_name
             uploader_uuid = (
                 upsert_user(uploaded_by_user_id, uploaded_by_username, uploaded_by_email,
-                            uploaded_by_roles, conn=conn)
+                            uploaded_by_roles, conn=conn, tenants=[group_value])
                 if uploaded_by_user_id else None
             )
             conn.execute(
                 """
                 UPDATE documents SET
                     source = source || %s::jsonb,
-                    metadata = metadata || %s::jsonb,
-                    uploaded_by_user_id = COALESCE(uploaded_by_user_id, %s::uuid)
+                    name = COALESCE(%s, name),
+                    metadata = CASE
+                        WHEN %s::text IS NULL OR metadata ? 'uploaded_by_user_id' THEN metadata
+                        ELSE metadata || jsonb_build_object('uploaded_by_user_id', %s::text)
+                    END
                 WHERE id = %s::uuid
                 """,
-                (Jsonb(patch), Jsonb(metadata_patch), uploader_uuid, doc_uuid),
+                (Jsonb(patch), name or None, uploader_uuid, uploader_uuid, doc_uuid),
             )
             cw = conn.execute(
                 "SELECT id FROM document_current_workflow WHERE document_id = %s::uuid", (doc_uuid,)
@@ -994,7 +1024,7 @@ def upsert_document(
             if cw:
                 conn.execute(
                     """
-                    UPDATE workflows SET current_stage = %s::workflow_stage, error_message = %s,
+                    UPDATE workflows SET current_stage = %s, error_message = %s,
                         stop_after_ocr = %s
                     WHERE id = %s::uuid
                     """,
@@ -1002,32 +1032,46 @@ def upsert_document(
                 )
             return doc_uuid
 
+        if not kind or not code:
+            raise ValueError("A new document needs kind and code")
         source = DocumentSource.model_validate(
             {k: v for k, v in source_patch.items() if v is not None}
         ).model_dump(exclude_none=True)
-        metadata = DocumentMetadata(
-            display_name=display_name, chunk_count=chunk_count
-        ).model_dump(exclude_none=True)
         user_uuid = (
             upsert_user(uploaded_by_user_id, uploaded_by_username, uploaded_by_email,
-                        uploaded_by_roles, conn=conn)
+                        uploaded_by_roles, conn=conn, tenants=[group_value])
             if uploaded_by_user_id else None
         )
-        row = conn.execute(
-            """
-            INSERT INTO documents (instance, source, metadata, valid_from, valid_to, uploaded_by_user_id)
-            VALUES (%s, %s, %s, %s::date, %s::date, %s::uuid)
-            RETURNING id
-            """,
-            (instance_value, Jsonb(source), Jsonb(metadata), valid_from, valid_to, user_uuid),
-        ).fetchone()
+        metadata = DocumentMetadata(
+            valid_from=valid_from, valid_to=valid_to, uploaded_by_user_id=user_uuid
+        ).model_dump(exclude_none=True)
+        catalog = get_or_create_catalog(get_or_create_group(group_value, conn=conn), kind, conn=conn)
+        try:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    INSERT INTO documents (catalog_id, code, name, aliases, source, metadata)
+                    VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        catalog["id"], code, name or code,
+                        [a for a in (aliases or []) if a], Jsonb(source), Jsonb(metadata),
+                    ),
+                ).fetchone()
+        except psycopg.errors.UniqueViolation as exc:
+            if exc.diag.constraint_name == "documents_catalog_id_code_key":
+                raise DuplicateDocumentCode(
+                    f"Code '{code}' is already used in the {kind} catalog of {group_value}"
+                ) from exc
+            raise
         if with_workflow:
             conn.execute(
                 """
                 INSERT INTO workflows (document_id, workflow_type, temporal_workflow_id,
                                        current_stage, error_message, stop_after_ocr,
                                        started_by_user_id)
-                VALUES (%s::uuid, %s::workflow_type_enum, %s, %s::workflow_stage, %s, %s, %s::uuid)
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::uuid)
                 """,
                 (
                     str(row["id"]),
@@ -1036,6 +1080,43 @@ def upsert_document(
                 ),
             )
         return str(row["id"])
+
+
+def reset_document_for_reupload(
+    doc_uuid: str,
+    *,
+    filename: str,
+    filepath: str,
+    fingerprint: str,
+    source_type: Optional[str] = None,
+    canonical_input_type: Optional[str] = None,
+) -> None:
+    """Point an existing document at a re-uploaded file.
+
+    ``source`` is replaced, pages and chunks are cleared for the new run, and
+    the document is flagged ``reindex_required`` because its vector index is now
+    stale. Earlier workflows and artifacts stay as history.
+    """
+    source = DocumentSource.model_validate({
+        "fingerprint": fingerprint,
+        "original_filename": filename,
+        "storage_uri": filepath,
+        "source_type": source_type,
+        "canonical_input_type": canonical_input_type,
+    }).model_dump(exclude_none=True)
+    with get_connection() as conn:
+        conn.execute("DELETE FROM pages WHERE document_id = %s::uuid", (doc_uuid,))
+        conn.execute("DELETE FROM chunks WHERE document_id = %s::uuid", (doc_uuid,))
+        conn.execute(
+            """
+            UPDATE documents SET
+                source = %s::jsonb,
+                metadata = (metadata - 'chunking')
+                    || jsonb_build_object('reindex_required', TRUE, 'reindex_reason', 'source_replaced')
+            WHERE id = %s::uuid
+            """,
+            (Jsonb(source), doc_uuid),
+        )
 
 
 def _load(conn, doc_uuid: str, column: str) -> dict:
@@ -1050,7 +1131,11 @@ def update_document_stage(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None
 ):
-    """Update the stage (of the document's current workflow) and counts."""
+    """Update the stage (of the document's current workflow).
+
+    ``page_count`` and ``chunk_count`` are accepted for call-site compatibility;
+    both are counted from ``pages`` and ``chunks``, so only the audit entry keeps them.
+    """
     old_stage = None
     audit_workflow_id = workflow_id
     with get_connection() as conn:
@@ -1065,7 +1150,7 @@ def update_document_stage(
             return
         old_stage = cw["current_stage"]
 
-        assignments = ["current_stage = %s::workflow_stage"]
+        assignments = ["current_stage = %s"]
         params: list = [stage]
         if error_message is not None:
             assignments.append("error_message = %s")
@@ -1087,18 +1172,7 @@ def update_document_stage(
             f"UPDATE workflows SET {', '.join(assignments)} WHERE id = %s::uuid", params
         )
 
-        doc_assignments = ["updated_at = now()"]
-        doc_params: list = []
-        if page_count is not None:
-            doc_assignments.append("source = source || jsonb_build_object('page_count', %s::int)")
-            doc_params.append(page_count)
-        if chunk_count is not None:
-            doc_assignments.append("metadata = metadata || jsonb_build_object('chunk_count', %s::int)")
-            doc_params.append(chunk_count)
-        doc_params.append(doc_uuid)
-        conn.execute(
-            f"UPDATE documents SET {', '.join(doc_assignments)} WHERE id = %s::uuid", doc_params
-        )
+        conn.execute("UPDATE documents SET updated_at = now() WHERE id = %s::uuid", (doc_uuid,))
         audit_workflow_id = _root_workflow_id(conn, doc_uuid) or workflow_id
 
     if old_stage and old_stage != stage:
@@ -1250,25 +1324,23 @@ def list_documents(
     stage: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
-    include_demo: bool = False,
     include_disabled: bool = False,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> list[dict]:
-    """List documents with optional stage / instance filters.
+    """List documents with optional stage / group filters.
 
     Args:
         stage: Filter by document stage
         limit: Max documents to return
         offset: Pagination offset
-        include_demo: If False (default), excludes demo documents from results
         include_disabled: If False (default), excludes soft-deleted documents from results
-        instances: If provided, only return docs whose instance is in this list
+        groups: If provided, only return docs whose group is in this list
     """
-    if instances is not None and not _normalize_instances(instances):
+    if groups is not None and not _normalize_groups(groups):
         return []
-    clauses, params = _document_filters(include_demo, include_disabled, instances)
+    clauses, params = _document_filters(include_disabled, groups)
     if stage:
-        clauses.append("cw.current_stage = %s::workflow_stage")
+        clauses.append("cw.current_stage = %s")
         params.append(stage)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_connection() as conn:
@@ -1300,14 +1372,13 @@ _SUMMARY_KEYS = (
 
 
 def get_document_summary_counts(
-    include_demo: bool = False,
     include_disabled: bool = False,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> dict:
     """Return aggregate document counts for dashboard and migration planning."""
-    if instances is not None and not _normalize_instances(instances):
+    if groups is not None and not _normalize_groups(groups):
         return {key: 0 for key in _SUMMARY_KEYS}
-    clauses, params = _document_filters(include_demo, include_disabled, instances)
+    clauses, params = _document_filters(include_disabled, groups)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_connection() as conn:
         row = conn.execute(
@@ -1330,6 +1401,8 @@ def get_document_summary_counts(
                 COALESCE(SUM((SELECT COUNT(*) FROM workflows j
                               WHERE j.document_id = d.id AND j.status = 'running')), 0) AS running_jobs
             FROM documents d
+            JOIN catalogs c ON c.id = d.catalog_id
+            JOIN groups g ON g.id = c.group_id
             LEFT JOIN document_current_workflow cw ON cw.document_id = d.id
             {where}
             """,
@@ -1338,37 +1411,38 @@ def get_document_summary_counts(
     return {key: int(row[key] or 0) for key in _SUMMARY_KEYS}
 
 
-def get_document_counts_by_instance(
-    include_demo: bool = False,
+def get_document_counts_by_group(
     include_disabled: bool = False,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> list[dict]:
-    """Return document counts grouped by instance (state), for dashboard breakdowns."""
-    if instances is not None and not _normalize_instances(instances):
+    """Return document counts grouped by group (state), for dashboard breakdowns."""
+    if groups is not None and not _normalize_groups(groups):
         return []
-    clauses, params = _document_filters(include_demo, include_disabled, instances)
+    clauses, params = _document_filters(include_disabled, groups)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_connection() as conn:
         rows = conn.execute(
             f"""
             SELECT
-                lower(d.instance) AS instance,
+                lower(g.name) AS "group",
                 COUNT(*) AS count,
                 COUNT(*) FILTER (WHERE cw.current_stage = 'completed') AS success,
                 COUNT(*) FILTER (WHERE cw.current_stage = 'failed') AS failed,
                 COUNT(*) FILTER (WHERE cw.current_stage IN
                     ('ocr_review', 'translation_review', 'chunk_review', 'approval_for_prod')) AS dev_approval
             FROM documents d
+            JOIN catalogs c ON c.id = d.catalog_id
+            JOIN groups g ON g.id = c.group_id
             LEFT JOIN document_current_workflow cw ON cw.document_id = d.id
             {where}
-            GROUP BY lower(d.instance)
-            ORDER BY count DESC, instance ASC
+            GROUP BY lower(g.name)
+            ORDER BY count DESC, "group" ASC
             """,
             params,
         ).fetchall()
     return [
         {
-            "instance": row["instance"],
+            "group": row["group"],
             "count": int(row["count"] or 0),
             "success": int(row["success"] or 0),
             "failed": int(row["failed"] or 0),
@@ -1376,18 +1450,6 @@ def get_document_counts_by_instance(
         }
         for row in rows
     ]
-
-
-def set_document_demo(workflow_id: str, is_demo: bool = True):
-    """Mark a document as demo (filtered from UI by default)."""
-    with get_connection() as conn:
-        doc_uuid = _resolve_document_uuid(conn, workflow_id)
-        if doc_uuid:
-            conn.execute(
-                "UPDATE documents SET metadata = metadata || jsonb_build_object('is_demo', %s::boolean) "
-                "WHERE id = %s::uuid",
-                (bool(is_demo), doc_uuid),
-            )
 
 
 def set_document_disabled(workflow_id: str, is_disabled: bool = True):
@@ -1421,7 +1483,7 @@ def purge_document(workflow_id: str, keep_audit: bool = True) -> dict:
 
     Audit rows are kept by default: they are the record that the deletion
     happened, not part of the document itself. Their ``document_id`` becomes
-    NULL; the ``workflow_id`` and ``instance`` snapshots stay.
+    NULL; the ``workflow_id`` and ``group`` snapshots stay.
 
     Returns a per-table count of deleted rows.
     """
@@ -1467,7 +1529,7 @@ def get_document_count(stage: Optional[str] = None) -> int:
                 """
                 SELECT COUNT(*) AS cnt FROM documents d
                 JOIN document_current_workflow cw ON cw.document_id = d.id
-                WHERE cw.current_stage = %s::workflow_stage
+                WHERE cw.current_stage = %s
                 """,
                 (stage,),
             ).fetchone()
@@ -1479,9 +1541,10 @@ def get_document_count(stage: Optional[str] = None) -> int:
 def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict]:
     """Update selected document fields and return the document.
 
-    Legacy flat names are mapped onto the tables: ``stage``/``error_message`` act
-    on the current workflow, ``scheme_*`` on the catalog entry, counts and
-    flags on the JSONB columns. Names derived from other rows (artifact and job
+    Flat names are mapped onto the tables: ``stage``/``error_message`` act on the
+    current workflow, ``code``/``name``/``aliases`` on the document columns,
+    ``kind`` moves the document to the group's catalog of that kind, and flags,
+    period and uploader go into ``metadata``. Names derived from other rows (counts, artifact and job
     pointers, completion timestamps) are accepted and ignored.
     """
     with get_connection() as conn:
@@ -1501,15 +1564,11 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
 
         for key, value in updates.items():
             if key == "stage":
-                wf_sets.append("current_stage = %s::workflow_stage")
+                wf_sets.append("current_stage = %s")
                 wf_params.append(value)
             elif key == "error_message":
                 wf_sets.append("error_message = %s")
                 wf_params.append(value)
-            elif key == "page_count":
-                source_patch["page_count"] = value
-            elif key == "chunk_count":
-                meta_patch["chunk_count"] = value
             elif key == "source_type":
                 source_patch["source_type"] = value
             elif key == "canonical_input_type":
@@ -1522,11 +1581,17 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
             elif key in ("document_id", "canonical_document_id", "source_file_fingerprint"):
                 if isinstance(value, str) and _FINGERPRINT_RE.match(value):
                     source_patch["fingerprint"] = value
-            elif key == "display_name":
+            elif key == "name":
                 if value:
-                    meta_patch["display_name"] = value
-                else:
-                    meta_remove.append("display_name")
+                    doc_sets.append("name = %s")
+                    doc_params.append(value)
+            elif key == "code":
+                if value:
+                    doc_sets.append("code = %s")
+                    doc_params.append(value)
+            elif key == "aliases":
+                doc_sets.append("aliases = %s")
+                doc_params.append([a for a in (value or []) if a])
             elif key in ("reindex_required", "catalog_visible", "network_visible"):
                 meta_patch[key] = bool(value)
             elif key == "reindex_reason":
@@ -1542,24 +1607,33 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
                     (bool(value), doc_uuid),
                 )
             elif key in ("valid_from", "valid_to"):
-                doc_sets.append(f"{key} = %s::date")
-                doc_params.append(value)
+                meta_patch[key] = value.isoformat() if isinstance(value, date) else value
             elif key == "uploaded_by_user_id" and value:
-                doc_sets.append("uploaded_by_user_id = COALESCE(uploaded_by_user_id, %s::uuid)")
-                doc_params.append(
-                    upsert_user(
+                has_uploader = conn.execute(
+                    "SELECT metadata ? 'uploaded_by_user_id' AS has FROM documents WHERE id = %s::uuid",
+                    (doc_uuid,),
+                ).fetchone()["has"]
+                if not has_uploader:
+                    meta_patch["uploaded_by_user_id"] = upsert_user(
                         str(value),
                         updates.get("uploaded_by_username"),
                         updates.get("uploaded_by_email"),
                         updates.get("uploaded_by_roles"),
                         conn=conn,
                     )
-                )
 
-        if any(k in updates for k in ("document_kind", "scheme_code", "scheme_name", "scheme_aliases_json")):
-            for column, new_value in _link_catalog_entry(conn, doc_uuid, updates).items():
-                doc_sets.append(f"{column} = %s" + ("::uuid" if column == "catalog_entry_id" else ""))
-                doc_params.append(new_value)
+        if updates.get("kind"):
+            current = conn.execute(
+                "SELECT c.group_id, c.type FROM documents d JOIN catalogs c ON c.id = d.catalog_id "
+                "WHERE d.id = %s::uuid",
+                (doc_uuid,),
+            ).fetchone()
+            if current["type"] != catalog_type_for_kind(str(updates["kind"])):
+                target = get_or_create_catalog(
+                    str(current["group_id"]), str(updates["kind"]), conn=conn
+                )
+                doc_sets.append("catalog_id = %s::uuid")
+                doc_params.append(target["id"])
 
         if source_patch:
             doc_sets.append("source = source || %s::jsonb")
@@ -1580,10 +1654,18 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
                 (*wf_params, doc_uuid),
             )
         if doc_sets:
-            conn.execute(
-                f"UPDATE documents SET {', '.join(doc_sets)} WHERE id = %s::uuid",
-                (*doc_params, doc_uuid),
-            )
+            try:
+                with conn.transaction():
+                    conn.execute(
+                        f"UPDATE documents SET {', '.join(doc_sets)} WHERE id = %s::uuid",
+                        (*doc_params, doc_uuid),
+                    )
+            except psycopg.errors.UniqueViolation as exc:
+                if exc.diag.constraint_name == "documents_catalog_id_code_key":
+                    raise DuplicateDocumentCode(
+                        "Another document in the target catalog already uses this code"
+                    ) from exc
+                raise
         elif wf_sets:
             conn.execute("UPDATE documents SET updated_at = now() WHERE id = %s::uuid", (doc_uuid,))
         return _fetch_document(conn, doc_uuid)
@@ -1732,8 +1814,8 @@ def create_document_job(
         if job_type == "promote_prod":
             adopted = conn.execute(
                 """
-                UPDATE workflows SET temporal_workflow_id = %s, status = %s::workflow_status_enum,
-                    current_stage = COALESCE(%s::workflow_stage, current_stage),
+                UPDATE workflows SET temporal_workflow_id = %s, status = %s,
+                    current_stage = COALESCE(%s, current_stage),
                     config = config || %s::jsonb
                 WHERE id = (
                     SELECT id FROM workflows
@@ -1751,8 +1833,8 @@ def create_document_job(
             """
             INSERT INTO workflows (document_id, workflow_type, temporal_workflow_id, status,
                                    current_stage, stop_after_ocr, config, started_by_user_id)
-            VALUES (%s::uuid, %s::workflow_type_enum, %s, %s::workflow_status_enum,
-                    COALESCE(%s, 'registered')::workflow_stage, %s, %s, %s::uuid)
+            VALUES (%s::uuid, %s, %s, %s,
+                    COALESCE(%s, 'registered'), %s, %s, %s::uuid)
             RETURNING id
             """,
             (
@@ -1778,9 +1860,9 @@ def update_document_job(job_id: str, **updates: object) -> Optional[dict]:
         if key not in allowed_fields:
             continue
         if key == "status":
-            set_clauses.append("status = %s::workflow_status_enum")
+            set_clauses.append("status = %s")
         elif key == "current_stage":
-            set_clauses.append("current_stage = %s::workflow_stage")
+            set_clauses.append("current_stage = %s")
         elif key == "completed_at":
             set_clauses.append("completed_at = %s::timestamptz")
         elif key == "temporal_run_id":
@@ -1838,20 +1920,19 @@ def list_document_jobs(workflow_id: str, limit: int = 50) -> list[dict]:
 def list_operations_queue(
     limit: int = 100,
     offset: int = 0,
-    include_demo: bool = False,
     include_disabled: bool = False,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
-    """List documents needing action, optionally scoped to tenant instances.
+    """List documents needing action, optionally scoped to tenant groups.
 
-    ``instances``:
+    ``groups``:
       - ``None`` - unrestricted (super admin / bypass)
       - ``[]`` - restricted user with no states -> empty result
-      - non-empty - only those document.instance values
+      - non-empty - only those document.group values
     """
-    if instances is not None and not _normalize_instances(instances):
+    if groups is not None and not _normalize_groups(groups):
         return [], 0
-    clauses, params = _document_filters(include_demo, include_disabled, instances)
+    clauses, params = _document_filters(include_disabled, groups)
     clauses.append(
         "(cw.current_stage IN ('ocr_review', 'translation_review', 'chunk_review', "
         "'ready_for_ingestion', 'approval_for_prod', 'failed') "
@@ -1861,6 +1942,8 @@ def list_operations_queue(
     where = f"WHERE {' AND '.join(clauses)}"
     from_sql = """
         FROM documents d
+        JOIN catalogs c ON c.id = d.catalog_id
+        JOIN groups g ON g.id = c.group_id
         JOIN document_current_workflow cw ON cw.document_id = d.id
     """
     with get_connection() as conn:
@@ -1874,7 +1957,7 @@ def list_operations_queue(
                  LIMIT 1) AS workflow_id,
                 d.source->>'original_filename' AS filename,
                 cw.current_stage AS stage,
-                d.instance,
+                lower(g.name) AS "group",
                 cw.error_message,
                 COALESCE((d.metadata->>'reindex_required')::boolean, FALSE) AS reindex_required,
                 d.metadata->>'reindex_reason' AS reindex_reason,
@@ -1896,24 +1979,24 @@ def list_runs(
     limit: int = 100,
     offset: int = 0,
     status: Optional[str] = None,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> list[dict]:
     """List workflows with document title fields for the Runs UI.
 
     Args:
-        instances: If provided, only return runs whose document instance is in
+        groups: If provided, only return runs whose document group is in
                    this list. Empty list returns no rows. None = unrestricted.
     """
     where_parts: list[str] = []
     params: list = []
     if status:
-        where_parts.append("w.status = %s::workflow_status_enum")
+        where_parts.append("w.status = %s")
         params.append(status)
-    if instances is not None:
-        normalized = _normalize_instances(instances)
+    if groups is not None:
+        normalized = _normalize_groups(groups)
         if not normalized:
             return []
-        where_parts.append("lower(d.instance) = ANY(%s)")
+        where_parts.append("lower(g.name) = ANY(%s)")
         params.append(normalized)
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     with get_connection() as conn:
@@ -1925,12 +2008,14 @@ def list_runs(
                     ORDER BY (r.workflow_type IN ('pipeline', 'ocr_only')) DESC, r.started_at ASC, r.id ASC
                     LIMIT 1) AS doc_workflow_id,
                    d.source->>'original_filename' AS filename,
-                   d.metadata->>'display_name' AS display_name,
+                   d.name AS name,
                    d.source->>'original_filename' AS source_filename,
                    cw.current_stage AS document_stage,
-                   d.instance AS instance
+                   lower(g.name) AS "group"
             FROM workflows w
             JOIN documents d ON d.id = w.document_id
+            JOIN catalogs c ON c.id = d.catalog_id
+            JOIN groups g ON g.id = c.group_id
             LEFT JOIN document_current_workflow cw ON cw.document_id = d.id
             {where_sql}
             ORDER BY w.started_at DESC, w.id DESC
@@ -1942,7 +2027,7 @@ def list_runs(
     for row in rows:
         job = _job_from_row(row)
         job["document_uuid"] = str(row["document_id"])
-        for extra in ("filename", "display_name", "source_filename", "document_stage", "instance"):
+        for extra in ("filename", "name", "source_filename", "document_stage", "group"):
             job[extra] = row[extra]
         result.append(job)
     return result
@@ -2024,7 +2109,7 @@ def add_document_artifact(
             """
             INSERT INTO workflow_artifacts (workflow_id, artifact_type, stage, storage_uri,
                                             mime_type, filename, size_bytes, metadata)
-            VALUES (%s::uuid, %s, %s::workflow_stage, %s, %s, %s, %s, %s)
+            VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -2063,7 +2148,7 @@ def get_document_artifact(workflow_id: str, artifact_id: str) -> Optional[dict]:
 
 
 # =============================================================================
-# Vector index state (documents.index_status)
+# Vector index state (documents.metadata.index_status)
 # =============================================================================
 
 def _index_entry_to_legacy(workflow_id: str, key: str, entry: dict) -> dict:
@@ -2092,7 +2177,7 @@ def upsert_document_index_status(
     status: str = "unknown",
     details: Optional[dict] = None,
 ) -> dict:
-    """Merge one index's state into ``documents.index_status``.
+    """Merge one index's state into ``documents.metadata.index_status``.
 
     The key is ``prod`` for the PROD collection names and ``dev`` otherwise;
     the collection name is kept inside the entry. ``None`` arguments leave the
@@ -2102,7 +2187,7 @@ def upsert_document_index_status(
     with get_connection() as conn:
         doc_uuid = _require_document_uuid(conn, workflow_id)
         row = conn.execute(
-            "SELECT index_status->%s::text AS entry FROM documents WHERE id = %s::uuid FOR UPDATE",
+            "SELECT metadata->'index_status'->%s::text AS entry FROM documents WHERE id = %s::uuid FOR UPDATE",
             (key, doc_uuid),
         ).fetchone()
         existing = dict(row["entry"] or {})
@@ -2118,7 +2203,9 @@ def upsert_document_index_status(
         merged = {**existing, **{k: v for k, v in incoming.items() if v is not None}, "status": status}
         validated = IndexState.model_validate(merged).model_dump()
         conn.execute(
-            "UPDATE documents SET index_status = index_status || jsonb_build_object(%s::text, %s::jsonb) "
+            "UPDATE documents SET metadata = jsonb_set("
+            "metadata || jsonb_build_object('index_status', COALESCE(metadata->'index_status', '{}'::jsonb)), "
+            "ARRAY['index_status', %s::text], %s::jsonb) "
             "WHERE id = %s::uuid",
             (key, Jsonb(validated), doc_uuid),
         )
@@ -2147,8 +2234,8 @@ def get_document_index_status(workflow_id: str, index_name: str) -> Optional[dic
     return None
 
 
-def list_index_summaries(include_demo: bool = False, include_disabled: bool = False) -> list[dict]:
-    clauses, params = _document_filters(include_demo, include_disabled, None)
+def list_index_summaries(include_disabled: bool = False) -> list[dict]:
+    clauses, params = _document_filters(include_disabled, None)
     where = f"AND {' AND '.join(clauses)}" if clauses else ""
     with get_connection() as conn:
         rows = conn.execute(
@@ -2161,7 +2248,7 @@ def list_index_summaries(include_demo: bool = False, include_disabled: bool = Fa
                          THEN 1 ELSE 0 END) AS stale_documents,
                 MAX(e.value->>'last_indexed_at') AS last_indexed_at,
                 array_agg(DISTINCT COALESCE(e.value->>'status', 'unknown')) AS statuses
-            FROM documents d, jsonb_each(d.index_status) e
+            FROM documents d, jsonb_each(COALESCE(d.metadata->'index_status', '{{}}'::jsonb)) e
             WHERE TRUE {where}
             GROUP BY COALESCE(e.value->>'index_name', e.key)
             ORDER BY index_name
@@ -2212,13 +2299,13 @@ def resolve_chunk_provenance(
     excerpt = text[:320] + ("..." if len(text) > 320 else "")
     page_start = int(chunk.get("page_start") or 1)
     page_end = int(chunk.get("page_end") or page_start)
-    display_name = doc.get("display_name") or doc.get("filename") or workflow_id
+    doc_name = doc.get("name") or doc.get("filename") or workflow_id
 
     return {
         "workflow_id": workflow_id,
         "doc_id": doc.get("document_id"),
         "filename": workflow_id,
-        "doc_name": display_name,
+        "doc_name": doc_name,
         "chunk_num": int(chunk_num),
         "page_start": page_start,
         "page_end": page_end,
@@ -2275,13 +2362,15 @@ def log_audit(
     roles = _csv_roles(actor_roles)
     with get_connection() as conn:
         doc_uuid = None if system_entry else _resolve_document_uuid(conn, workflow_id)
-        instance = None
+        group_uuid = None
         stored_workflow_id = None if system_entry else workflow_id
         if doc_uuid:
             doc_row = conn.execute(
-                "SELECT instance FROM documents WHERE id = %s::uuid", (doc_uuid,)
+                "SELECT c.group_id FROM documents d JOIN catalogs c ON c.id = d.catalog_id "
+                "WHERE d.id = %s::uuid",
+                (doc_uuid,),
             ).fetchone()
-            instance = doc_row["instance"]
+            group_uuid = str(doc_row["group_id"])
             if _is_uuid(workflow_id):
                 stored_workflow_id = _root_workflow_id(conn, doc_uuid) or workflow_id
         if stored_workflow_id is None and entity not in ("setting", "catalog"):
@@ -2292,14 +2381,14 @@ def log_audit(
         )
         row = conn.execute(
             """
-            INSERT INTO audit_logs (document_id, workflow_id, instance, action_type, entity_type,
+            INSERT INTO audit_logs (document_id, workflow_id, group_id, action_type, entity_type,
                                     entity_number, field_name, old_value, new_value, metadata,
                                     actor_user_id, actor)
-            VALUES (%s::uuid, %s, %s, %s, %s::audit_entity_type, %s, %s, %s, %s, %s, %s::uuid, %s)
+            VALUES (%s::uuid, %s, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::uuid, %s)
             RETURNING id
             """,
             (
-                doc_uuid, stored_workflow_id, instance, action_type, entity, entity_id,
+                doc_uuid, stored_workflow_id, group_uuid, action_type, entity, entity_id,
                 field_name, old_value, new_value, Jsonb(metadata or {}), actor_uuid,
                 Jsonb({"username": actor_username or None, "email": actor_email or None, "roles": roles})
                 if (actor_user_id or actor_username or actor_email or roles) else Jsonb({}),
@@ -2371,17 +2460,20 @@ def _normalize_audit_row(row) -> dict:
 
 _AUDIT_SELECT = """
     SELECT a.id, a.workflow_id, a.action_type, a.entity_type, a.entity_number, a.field_name,
-           a.old_value, a.new_value, a.metadata, a.created_at, a.actor, a.instance AS audit_instance,
+           a.old_value, a.new_value, a.metadata, a.created_at, a.actor, ag.name AS audit_group,
            au.keycloak_user_id AS actor_keycloak_id,
            d.source->>'fingerprint' AS doc_fingerprint,
            d.source->>'original_filename' AS filename,
-           d.metadata->>'display_name' AS display_name,
-           d.instance AS doc_instance,
+           d.name AS document_name,
+           dg.name AS doc_group,
            uu.username AS uploaded_by_username, uu.email AS uploaded_by_email
     FROM audit_logs a
     LEFT JOIN documents d ON d.id = a.document_id
+    LEFT JOIN groups ag ON ag.id = a.group_id
+    LEFT JOIN catalogs dc ON dc.id = d.catalog_id
+    LEFT JOIN groups dg ON dg.id = dc.group_id
     LEFT JOIN users au ON au.id = a.actor_user_id
-    LEFT JOIN users uu ON uu.id = d.uploaded_by_user_id
+    LEFT JOIN users uu ON uu.id = NULLIF(d.metadata->>'uploaded_by_user_id', '')::uuid
 """
 
 
@@ -2414,8 +2506,8 @@ def _audit_row_to_legacy(row: dict) -> dict:
         "actor_email": actor.get("email"),
         "actor_roles": ",".join(roles) if roles else None,
         "filename": row["filename"],
-        "display_name": row["display_name"],
-        "instance": row["doc_instance"] or row["audit_instance"],
+        "name": row["document_name"],
+        "group": row["doc_group"] or row["audit_group"],
         "uploaded_by_username": row["uploaded_by_username"],
         "uploaded_by_email": row["uploaded_by_email"],
     }
@@ -2472,16 +2564,16 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
 
 
 def _global_audit_filters(
-    action_type: Optional[str], instances: Optional[list[str]]
+    action_type: Optional[str], groups: Optional[list[str]]
 ) -> tuple[list[str], list]:
     where_parts: list[str] = ["a.action_type <> %s"]
     params: list = [CATALOG_VERSION_ACTION]
     if action_type:
         where_parts.append("a.action_type = %s")
         params.append(action_type)
-    if instances is not None:
-        where_parts.append("lower(COALESCE(a.instance, d.instance, %s)) = ANY(%s)")
-        params.extend([_default_instance(), _normalize_instances(instances)])
+    if groups is not None:
+        where_parts.append("lower(COALESCE(ag.name, dg.name, %s)) = ANY(%s)")
+        params.extend([_default_group(), _normalize_groups(groups)])
     return where_parts, params
 
 
@@ -2489,7 +2581,7 @@ def get_all_audit_logs(
     action_type: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Get all audit logs across all documents.
@@ -2498,14 +2590,14 @@ def get_all_audit_logs(
         action_type: Optional filter by action type
         limit: Maximum number of entries to return
         offset: Offset for pagination
-        instances: Tenant scope (None = all, [] = none)
+        groups: Tenant scope (None = all, [] = none)
 
     Returns:
         List of audit log entries as dicts, with document filename included
     """
-    if instances is not None and not _normalize_instances(instances):
+    if groups is not None and not _normalize_groups(groups):
         return []
-    where_parts, params = _global_audit_filters(action_type, instances)
+    where_parts, params = _global_audit_filters(action_type, groups)
     with get_connection() as conn:
         rows = conn.execute(
             f"{_AUDIT_SELECT} WHERE {' AND '.join(where_parts)} "
@@ -2517,15 +2609,19 @@ def get_all_audit_logs(
 
 def get_all_audit_log_count(
     action_type: Optional[str] = None,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> int:
     """Get total count of all audit logs (optionally tenant-scoped)."""
-    if instances is not None and not _normalize_instances(instances):
+    if groups is not None and not _normalize_groups(groups):
         return 0
-    where_parts, params = _global_audit_filters(action_type, instances)
+    where_parts, params = _global_audit_filters(action_type, groups)
     with get_connection() as conn:
         row = conn.execute(
-            f"SELECT COUNT(*) AS cnt FROM audit_logs a LEFT JOIN documents d ON d.id = a.document_id "
+            "SELECT COUNT(*) AS cnt FROM audit_logs a "
+            "LEFT JOIN documents d ON d.id = a.document_id "
+            "LEFT JOIN groups ag ON ag.id = a.group_id "
+            "LEFT JOIN catalogs dc ON dc.id = d.catalog_id "
+            "LEFT JOIN groups dg ON dg.id = dc.group_id "
             f"WHERE {' AND '.join(where_parts)}",
             params,
         ).fetchone()
@@ -2876,8 +2972,8 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
     Save all chunks for a document.
 
     Re-chunking runs in one transaction: the document's chunks are deleted, the
-    new ones inserted, and ``metadata.chunk_count`` and ``metadata.chunking``
-    (with ``run_number`` incremented) updated together.
+    new ones inserted, and ``metadata.chunking`` (with ``run_number``
+    incremented) updated together.
     """
     with get_connection() as conn:
         doc_uuid = _require_document_uuid(conn, workflow_id)
@@ -2921,7 +3017,7 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                     chunk.get("reviewer_notes"),
                 ),
             )
-        meta_patch: dict[str, Any] = {"chunk_count": len(chunks)}
+        meta_patch: dict[str, Any] = {}
         if chunks:
             first = chunks[0]
             meta_patch["chunking"] = ChunkingRun(
@@ -2931,10 +3027,13 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                 config=_load_json_value(first.get("chunking_config_json"), {}),
                 created_at=_iso_now(),
             ).model_dump()
-        conn.execute(
-            "UPDATE documents SET metadata = metadata || %s::jsonb WHERE id = %s::uuid",
-            (Jsonb(meta_patch), doc_uuid),
-        )
+        if meta_patch:
+            conn.execute(
+                "UPDATE documents SET metadata = metadata || %s::jsonb WHERE id = %s::uuid",
+                (Jsonb(meta_patch), doc_uuid),
+            )
+        else:
+            conn.execute("UPDATE documents SET updated_at = now() WHERE id = %s::uuid", (doc_uuid,))
 
 
 def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:
@@ -2959,12 +3058,12 @@ def search_chunks(
     offset: int = 0,
     include_excluded: bool = False,
     stage: Optional[str] = None,
-    instances: Optional[list[str]] = None,
+    groups: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
     """Search chunks across documents for maintainer workflows.
 
-    instances: If provided, only return chunks whose owning document's instance
-    is in this list (tenant scoping). ``None`` means no instance restriction.
+    groups: If provided, only return chunks whose owning document's group
+    is in this list (tenant scoping). ``None`` means no group restriction.
     """
     where_clauses = ["TRUE"]
     params: list = []
@@ -2972,14 +3071,14 @@ def search_chunks(
     if not include_excluded:
         where_clauses.append("NOT c.is_excluded")
     if stage:
-        where_clauses.append("cw.current_stage = %s::workflow_stage")
+        where_clauses.append("cw.current_stage = %s")
         params.append(stage)
-    if instances is not None:
-        normalized = _normalize_instances(instances)
+    if groups is not None:
+        normalized = _normalize_groups(groups)
         if not normalized:
             where_clauses.append("FALSE")
         else:
-            where_clauses.append("lower(d.instance) = ANY(%s)")
+            where_clauses.append("lower(g.name) = ANY(%s)")
             params.append(normalized)
     if query and query.strip():
         where_clauses.append("lower(coalesce(c.edited_text, c.original_text)) LIKE %s")
@@ -2988,6 +3087,8 @@ def search_chunks(
     base_from_sql = f"""
         FROM chunks c
         JOIN documents d ON d.id = c.document_id
+        JOIN catalogs cat ON cat.id = d.catalog_id
+        JOIN groups g ON g.id = cat.group_id
         LEFT JOIN document_current_workflow cw ON cw.document_id = d.id
         WHERE {' AND '.join(where_clauses)}
     """
@@ -3003,7 +3104,7 @@ def search_chunks(
                 d.metadata->'chunking' AS chunking,
                 d.source->>'fingerprint' AS document_id,
                 d.source->>'original_filename' AS filename,
-                d.metadata->>'display_name' AS display_name,
+                d.name AS name,
                 cw.current_stage AS stage,
                 d.updated_at AS document_updated_at,
                 (SELECT r.temporal_workflow_id FROM workflows r WHERE r.document_id = d.id
@@ -3020,7 +3121,7 @@ def search_chunks(
     for row in rows:
         row = dict(row)
         chunk = _chunk_from_row(row, row["root_workflow_id"])
-        for extra in ("document_id", "filename", "display_name", "stage", "document_updated_at"):
+        for extra in ("document_id", "filename", "name", "stage", "document_updated_at"):
             chunk[extra] = _clean(row[extra])
         chunks.append(chunk)
     return chunks, total

@@ -27,4 +27,4 @@ class DocumentRepository:
         doc = self._db.get_document(workflow_id)
         if not doc:
             return None
-        return doc.get("document_kind")
+        return doc.get("kind")

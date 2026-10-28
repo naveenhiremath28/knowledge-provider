@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DocumentStage(str, Enum):
@@ -26,6 +26,34 @@ class DocumentStage(str, Enum):
     INGESTING_PROD = "ingesting_prod"            # Promoting / ingesting into PROD vector index
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class WorkflowType(str, Enum):
+    """``workflows.workflow_type``: kind of processing run. Stored as TEXT."""
+    PIPELINE = "pipeline"
+    OCR_ONLY = "ocr_only"
+    OCR_RETRY = "ocr_retry"
+    TRANSLATION_RETRY = "translation_retry"
+    CHUNKING_RETRY = "chunking_retry"
+    REINGEST = "reingest"
+    PROMOTE_PROD = "promote_prod"
+
+
+class WorkflowStatus(str, Enum):
+    """``workflows.status``. Stored as TEXT."""
+    RUNNING = "running"
+    WAITING_REVIEW = "waiting_review"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class AuditEntityType(str, Enum):
+    """``audit_logs.entity_type``. Stored as TEXT."""
+    DOCUMENT = "document"
+    PAGE = "page"
+    CHUNK = "chunk"
+    SETTING = "setting"
+    CATALOG = "catalog"
 
 
 # Pipeline stage order for stepper UI
@@ -185,12 +213,12 @@ class DocumentSummary(BaseModel):
     canonical_document_id: Optional[str] = None
     workflow_id: str  # The Temporal workflow ID (use this for API calls)
     filename: str
-    display_name: Optional[str] = None
+    name: Optional[str] = None  # documents.name
     source_filename: Optional[str] = None
     source_manifest_name: Optional[str] = None
     source_file_fingerprint: Optional[str] = None
     authoritative: bool = False
-    instance: str = "default"
+    group: str = "default"  # tenant code (groups.name) of the document's catalog
     stage: DocumentStage
     page_count: int
     chunk_count: int
@@ -204,11 +232,11 @@ class DocumentSummary(BaseModel):
     uploaded_by_username: Optional[str] = None
     uploaded_by_email: Optional[str] = None
     uploaded_by_roles: list[str] = []
-    # Scheme catalog metadata (document_kind scheme → Master Catalog)
-    document_kind: str = "document"
-    scheme_code: Optional[str] = None
-    scheme_name: Optional[str] = None
-    scheme_aliases: list[str] = []
+    # Catalog placement: kind comes from the catalog type, code/name/aliases are
+    # the document's own (a scheme's code feeds the Master Catalog).
+    kind: Optional[str] = None  # scheme | advisory
+    code: Optional[str] = None
+    aliases: list[str] = []
     tool_routing: Optional[str] = None
     catalog_visible: bool = True
     network_visible: bool = True
@@ -231,10 +259,10 @@ class SchemeMetadataUpdate(BaseModel):
     `document_validity.parse_period` so a bad period comes back as the same
     400 a bad kind does, not a Pydantic 422.
     """
-    document_kind: Optional[str] = None  # document | scheme
-    scheme_code: Optional[str] = None
-    scheme_name: Optional[str] = None
-    scheme_aliases: Optional[list[str]] = None
+    kind: Optional[str] = None  # scheme | advisory
+    code: Optional[str] = None
+    name: Optional[str] = None
+    aliases: Optional[list[str]] = None
     tool_routing: Optional[str] = None  # qdrant | legacy | both
     catalog_visible: Optional[bool] = None
     network_visible: Optional[bool] = None
@@ -312,8 +340,8 @@ class DocumentGraph(BaseModel):
     runtime: dict[str, Any]
 
 
-class InstanceDocumentCount(BaseModel):
-    instance: str
+class GroupDocumentCount(BaseModel):
+    group: str
     count: int
     success: int = 0
     failed: int = 0
@@ -328,7 +356,7 @@ class DocumentCohortsResponse(BaseModel):
     review_queue: int
     failed_documents: int
     by_stage: dict[str, int]
-    by_instance: list[InstanceDocumentCount] = []
+    by_group: list[GroupDocumentCount] = []
     needs_reindex: int
     running_jobs: int = 0
 
@@ -404,8 +432,8 @@ class AuditLogEntry(BaseModel):
     # Document context — joined from documents. Without these declared, FastAPI
     # strips them from the response and the UI can only show a raw doc_id hash.
     filename: Optional[str] = None
-    display_name: Optional[str] = None
-    instance: Optional[str] = None
+    name: Optional[str] = None
+    group: Optional[str] = None
     uploaded_by_username: Optional[str] = None
     uploaded_by_email: Optional[str] = None
 
@@ -493,7 +521,6 @@ class DocumentSource(BaseModel):
     storage_uri: Optional[str] = None
     source_type: Optional[str] = None  # spreadsheet | document | unknown
     canonical_input_type: Optional[str] = None  # spreadsheet | pdf
-    page_count: Optional[int] = Field(default=None, ge=0)
 
 
 class IndexState(BaseModel):
@@ -521,17 +548,42 @@ class ChunkingRun(BaseModel):
 
 
 class DocumentMetadata(BaseModel):
-    """``documents.metadata``: display and flag fields."""
+    """``documents.metadata``: period, uploader, index state and flag fields."""
     model_config = ConfigDict(extra="forbid")
 
-    display_name: Optional[str] = None
+    valid_from: Optional[str] = None  # YYYY-MM-DD
+    valid_to: Optional[str] = None  # YYYY-MM-DD, None = no end
+    uploaded_by_user_id: Optional[str] = None  # users.id (UUID string)
+    index_status: dict[str, IndexState] = Field(default_factory=dict)  # keys dev / prod
     catalog_visible: bool = True
     network_visible: bool = True
-    is_demo: bool = False
-    chunk_count: int = Field(default=0, ge=0)
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     chunking: Optional[ChunkingRun] = None
+
+    @model_validator(mode="after")
+    def _period_is_ordered(self) -> "DocumentMetadata":
+        if self.valid_from and self.valid_to and self.valid_from > self.valid_to:
+            raise ValueError("valid_from must not be after valid_to")
+        return self
+
+
+class CatalogNetworkState(BaseModel):
+    """``catalogs.metadata.network``: set once the catalog is published."""
+    model_config = ConfigDict(extra="forbid")
+
+    catalog_id: Optional[str] = None
+    last_published_at: Optional[str] = None
+
+
+class CatalogMetadata(BaseModel):
+    """``catalogs.metadata``: Beckn publish information."""
+    model_config = ConfigDict(extra="forbid")
+
+    publish_directives: dict[str, Any] = Field(default_factory=dict)
+    visible_networks: list[str] = Field(default_factory=list)
+    criteria: dict[str, Any] = Field(default_factory=dict)
+    network: Optional[CatalogNetworkState] = None
 
 
 class PageMetadata(BaseModel):

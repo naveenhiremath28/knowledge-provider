@@ -33,6 +33,36 @@ SCHEME_TOPICS = ["Government schemes"]
 
 DEFAULT_DOCUMENT_KIND = "document"
 
+# Knowledge kinds the pipeline serves, and the network schema each maps to.
+# ``catalogs.type`` stores the schema name; code asks this map what a type means
+# instead of comparing ``openagrinet:*`` strings. The scheme mapping is a
+# placeholder (ADR 0003 types schemes as KnowledgeAdvisory) - change it here only.
+KIND_SCHEME = "scheme"
+KIND_ADVISORY = "advisory"
+KIND_TO_CATALOG_TYPE = {
+    KIND_SCHEME: "openagrinet:AgricultureResource",
+    KIND_ADVISORY: "openagrinet:KnowledgeAdvisory",
+}
+CATALOG_TYPE_TO_KIND = {schema: kind for kind, schema in KIND_TO_CATALOG_TYPE.items()}
+
+
+def catalog_type_for_kind(kind: str) -> str:
+    """``catalogs.type`` for a knowledge kind; ValueError for an unknown kind."""
+    try:
+        return KIND_TO_CATALOG_TYPE[(kind or "").strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f"Unknown document kind {kind!r}. Use one of: {', '.join(KIND_TO_CATALOG_TYPE)}"
+        ) from None
+
+
+def kind_for_catalog_type(catalog_type: str) -> str:
+    """Knowledge kind a ``catalogs.type`` stands for; ValueError for an unknown type."""
+    try:
+        return CATALOG_TYPE_TO_KIND[catalog_type]
+    except KeyError:
+        raise ValueError(f"Unknown catalog type {catalog_type!r}") from None
+
 # Same provider on every catalog - this pipeline publishes as one provider
 # regardless of knowledge kind.
 CATALOG_PROVIDER = {
