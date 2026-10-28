@@ -816,3 +816,65 @@ class TestWorkerActivityRegistration:
         missing = {name for name in defined_activities if name not in worker_source}
 
         assert not missing, f"Activities defined but never registered on the worker: {missing}"
+
+
+class TestSupersededPoints:
+    """After new content is indexed, points of earlier file versions are deleted."""
+
+    class _Store:
+        def __init__(self, failing=()):
+            self.calls = []
+            self.failing = set(failing)
+
+        def delete_by_doc_id(self, collection, doc_id):
+            self.calls.append((collection, doc_id))
+            if doc_id in self.failing:
+                return {"deleted": 0, "doc_id": doc_id, "error": "boom"}
+            return {"deleted": -1, "doc_id": doc_id}
+
+    @staticmethod
+    def _document(db):
+        doc_uuid = db.upsert_document(
+            workflow_id="wf-sup-act",
+            document_id="c" * 32,
+            filename="a.pdf",
+            filepath="minio://documents/a.pdf",
+            kind="scheme",
+            code="sup-act",
+        )
+        db.upsert_document_index_status("wf-sup-act", "documents-index", doc_id="a" * 32, status="indexed")
+        db.reset_document_for_reupload(
+            doc_uuid, filename="b.pdf", filepath="minio://documents/b.pdf", fingerprint="c" * 32
+        )
+        return doc_uuid
+
+    @pytest.mark.asyncio
+    @pytest.mark.db
+    @pytest.mark.unit
+    async def test_old_keys_are_deleted_and_forgotten(self, db_connection):
+        from pipeline import activities
+
+        doc_uuid = self._document(db_connection)
+        store = self._Store()
+
+        await activities._drop_superseded_points(
+            "dev", "wf-sup-act", db_connection.get_document(doc_uuid), "c" * 32, "documents-index", store=store
+        )
+
+        assert store.calls == [("documents-index", "a" * 32)]
+        assert db_connection.get_document(doc_uuid)["superseded_doc_ids"] == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.db
+    @pytest.mark.unit
+    async def test_a_failed_delete_keeps_the_key_for_the_next_run(self, db_connection):
+        from pipeline import activities
+
+        doc_uuid = self._document(db_connection)
+        store = self._Store(failing={"a" * 32})
+
+        await activities._drop_superseded_points(
+            "dev", "wf-sup-act", db_connection.get_document(doc_uuid), "c" * 32, "documents-index", store=store
+        )
+
+        assert db_connection.get_document(doc_uuid)["superseded_doc_ids"] == {"dev": ["a" * 32]}

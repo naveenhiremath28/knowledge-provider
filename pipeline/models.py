@@ -560,6 +560,11 @@ class DocumentMetadata(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     chunking: Optional[ChunkingRun] = None
+    # Vector-index keys (doc_id) of earlier file versions still present in an
+    # index, by env (``dev`` / ``prod``). A re-upload changes the fingerprint, so
+    # the old points would otherwise be orphaned; the next ingest/promote and
+    # disable/purge remove them.
+    superseded_doc_ids: dict[str, list[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _period_is_ordered(self) -> "DocumentMetadata":

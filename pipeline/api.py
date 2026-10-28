@@ -420,6 +420,29 @@ def _document_title(filename: str) -> str:
     return re.sub(r"[_\-\s]+", " ", stem).strip() or "Untitled document"
 
 
+def _assert_can_replace(user: AuthUser, existing: dict) -> None:
+    """Replacing a document's file clears its pages and chunks, so guard it.
+
+    Needs review rights in the document's group; a disabled document or one with
+    a run in progress cannot be replaced; a document already promoted to PROD
+    can only be replaced by someone who may approve ingestion.
+    """
+    doc_group = existing["group"]
+    if not user.has_permission_for_group(Permission.REVIEW, doc_group):
+        raise HTTPException(403, f"No permission to replace documents in group: {doc_group}")
+    if existing.get("is_disabled"):
+        raise HTTPException(409, "This document is disabled; restore it before replacing its file")
+    latest_job = db.get_latest_document_job(existing["workflow_id"])
+    if latest_job and latest_job.get("status") == "running":
+        raise HTTPException(409, "A run is still in progress for this document")
+    if (existing.get("index_status") or {}).get("prod") and not user.has_permission_for_group(
+        Permission.APPROVE_INGESTION, doc_group
+    ):
+        raise HTTPException(
+            403, "Replacing a document that is live in PROD needs approval rights in its group"
+        )
+
+
 def _resolve_document_identity(
     user: AuthUser,
     group: str,
@@ -432,12 +455,19 @@ def _resolve_document_identity(
     An explicit ``code`` that is already held in the tenant's catalog of that
     kind means "update this document": the caller reuses it instead of inserting.
     Without a code one is derived from the file name.
+
+    Permissions are checked against the target group, not just globally: a user
+    who may upload in one state must not be able to add to, or replace a
+    document of, a state where they only hold a view role. Replacing clears the
+    document's pages and chunks, so it also needs review rights in that group.
     """
     kind = (kind or "").strip().lower()
     try:
         catalog_type_for_kind(kind)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if not user.has_permission_for_group(Permission.UPLOAD, group):
+        raise HTTPException(403, f"No upload permission in group: {group}")
     code = (code or "").strip()
     if code:
         try:
@@ -447,6 +477,7 @@ def _resolve_document_identity(
         existing = db.find_document_by_code(group, kind, code)
         if existing:
             existing = assert_document_group_access(user, existing)
+            _assert_can_replace(user, existing)
         return kind, code, existing
     return kind, scheme_catalog.derive_scheme_code(_document_title(filename), kind=kind), None
 
@@ -1719,10 +1750,28 @@ def _require_catalog_read(request: Request, user: AuthUser) -> None:
     raise HTTPException(403, "Catalog access requires search or admin permission")
 
 
+def _vector_doc_ids(doc: dict, env: str) -> list[str]:
+    """The document's current index key plus keys of earlier file versions still in ``env``."""
+    ids = [doc.get("document_id")]
+    ids.extend((doc.get("superseded_doc_ids") or {}).get(env, []))
+    return list(dict.fromkeys(i for i in ids if i))
+
+
+def _delete_all_doc_ids(store, collection: str, doc_ids: list[str]) -> dict:
+    results = [store.delete_by_doc_id(collection, doc_id) for doc_id in doc_ids]
+    if len(results) == 1:
+        return results[0]
+    errors = [r["error"] for r in results if r.get("error")]
+    summary = {"deleted": 0 if errors else -1, "doc_ids": doc_ids, "results": results}
+    if errors:
+        summary["error"] = "; ".join(errors)
+    return summary
+
+
 def _delete_document_points_from_prod(doc: dict) -> dict:
     """Best-effort delete of a promoted (non-scheme) document's vectors from PROD documents-index."""
-    doc_id = doc.get("document_id")
-    if not doc_id:
+    doc_ids = _vector_doc_ids(doc, "prod")
+    if not doc_ids:
         return {"deleted": False, "reason": "no_doc_id"}
     prod_url = (os.environ.get("PROD_VECTOR_DB_URL") or "").strip()
     if not prod_url:
@@ -1738,15 +1787,15 @@ def _delete_document_points_from_prod(doc: dict) -> dict:
 
         client = get_qdrant_client(url=prod_url, api_key=prod_key)
         store = QdrantVectorStore(client=client)
-        return store.delete_by_doc_id(collection, doc_id)
+        return _delete_all_doc_ids(store, collection, doc_ids)
     except Exception as exc:
         return {"deleted": False, "error": str(exc), "collection": collection}
 
 
 def _delete_scheme_points_from_prod(doc: dict) -> dict:
     """Best-effort delete of scheme vectors from PROD schemes-index."""
-    doc_id = doc.get("document_id")
-    if not doc_id:
+    doc_ids = _vector_doc_ids(doc, "prod")
+    if not doc_ids:
         return {"deleted": False, "reason": "no_doc_id"}
     prod_url = (
         (os.environ.get("PROD_SCHEME_VECTOR_DB_URL") or "").strip()
@@ -1767,7 +1816,7 @@ def _delete_scheme_points_from_prod(doc: dict) -> dict:
 
         client = get_qdrant_client(url=prod_url, api_key=prod_key)
         store = QdrantVectorStore(client=client)
-        return store.delete_by_doc_id(collection, doc_id)
+        return _delete_all_doc_ids(store, collection, doc_ids)
     except Exception as exc:
         return {"deleted": False, "error": str(exc), "collection": collection}
 
@@ -2179,16 +2228,25 @@ async def disable_document(
 
     # Remove from the DEV vector index if requested
     if remove_from_search:
-        doc_id = doc.get("document_id")
-        if doc_id:
+        # The current index key plus keys of earlier file versions still in DEV
+        # (see metadata.superseded_doc_ids).
+        for index, doc_id in enumerate(_vector_doc_ids(doc, "dev")):
             vector_result = delete_chunks_from_index(doc_id)
-            result["vector_deleted"] = vector_result.get("deleted", 0)
+            if index == 0:
+                result["vector_deleted"] = vector_result.get("deleted", 0)
             if "error" in vector_result:
                 result["vector_error"] = vector_result["error"]
 
-        # PROD Qdrant cleanup, if this document was ever promoted
+        # PROD Qdrant cleanup, if this document was ever promoted. A document
+        # promoted as a scheme lives in the scheme index even if its kind was
+        # changed since, so the PROD index entry decides, not only the kind.
         kind = (doc.get("kind") or "").strip().lower()
-        if kind == "scheme":
+        prod_entry = (doc.get("index_status") or {}).get("prod") or {}
+        prod_is_scheme = (
+            kind == "scheme"
+            or prod_entry.get("index_name") == scheme_catalog.scheme_collection_name()
+        )
+        if prod_is_scheme:
             q_result = _delete_scheme_points_from_prod(doc)
             result["scheme_qdrant_deleted"] = q_result
             try:

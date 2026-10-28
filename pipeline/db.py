@@ -392,6 +392,7 @@ def _document_from_row(row: Optional[dict]) -> Optional[dict]:
         "latest_job_id": row["current_workflow_pk"],
         "catalog_id": row["catalog_id"],
         "index_status": meta.get("index_status") or {},
+        "superseded_doc_ids": meta.get("superseded_doc_ids") or {},
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -1096,6 +1097,11 @@ def reset_document_for_reupload(
     ``source`` is replaced, pages and chunks are cleared for the new run, and
     the document is flagged ``reindex_required`` because its vector index is now
     stale. Earlier workflows and artifacts stay as history.
+
+    The fingerprint is the document's key in the vector index, so the old key
+    is remembered in ``metadata.superseded_doc_ids`` for every index (dev/prod)
+    that holds it. The next ingest/promote and disable/purge delete those points;
+    without this they would stay searchable with nothing pointing at them.
     """
     source = DocumentSource.model_validate({
         "fingerprint": fingerprint,
@@ -1105,6 +1111,19 @@ def reset_document_for_reupload(
         "canonical_input_type": canonical_input_type,
     }).model_dump(exclude_none=True)
     with get_connection() as conn:
+        current = conn.execute(
+            "SELECT source->>'fingerprint' AS fingerprint, metadata FROM documents "
+            "WHERE id = %s::uuid FOR UPDATE",
+            (doc_uuid,),
+        ).fetchone()
+        if current is None:
+            raise LookupError(f"Document not found: {doc_uuid}")
+        meta = current["metadata"] or {}
+        superseded = {k: list(v) for k, v in (meta.get("superseded_doc_ids") or {}).items()}
+        for env, entry in (meta.get("index_status") or {}).items():
+            old_key = (entry or {}).get("doc_id") or current["fingerprint"]
+            if old_key and old_key != fingerprint and old_key not in superseded.get(env, []):
+                superseded.setdefault(env, []).append(old_key)
         conn.execute("DELETE FROM pages WHERE document_id = %s::uuid", (doc_uuid,))
         conn.execute("DELETE FROM chunks WHERE document_id = %s::uuid", (doc_uuid,))
         conn.execute(
@@ -1112,10 +1131,34 @@ def reset_document_for_reupload(
             UPDATE documents SET
                 source = %s::jsonb,
                 metadata = (metadata - 'chunking')
-                    || jsonb_build_object('reindex_required', TRUE, 'reindex_reason', 'source_replaced')
+                    || jsonb_build_object('reindex_required', TRUE, 'reindex_reason', 'source_replaced',
+                                          'superseded_doc_ids', %s::jsonb)
             WHERE id = %s::uuid
             """,
-            (Jsonb(source), doc_uuid),
+            (Jsonb(source), Jsonb(superseded), doc_uuid),
+        )
+
+
+def clear_superseded_doc_ids(workflow_id: str, env: str, doc_ids: list[str]) -> None:
+    """Forget superseded index keys once their points are deleted from ``env`` (dev/prod)."""
+    with get_connection() as conn:
+        doc_uuid = _resolve_document_uuid(conn, workflow_id)
+        if doc_uuid is None:
+            return
+        row = conn.execute(
+            "SELECT metadata->'superseded_doc_ids' AS sup FROM documents WHERE id = %s::uuid FOR UPDATE",
+            (doc_uuid,),
+        ).fetchone()
+        superseded = {k: list(v) for k, v in (row["sup"] or {}).items()}
+        remaining = [i for i in superseded.get(env, []) if i not in set(doc_ids)]
+        if remaining:
+            superseded[env] = remaining
+        else:
+            superseded.pop(env, None)
+        conn.execute(
+            "UPDATE documents SET metadata = metadata || jsonb_build_object('superseded_doc_ids', %s::jsonb) "
+            "WHERE id = %s::uuid",
+            (Jsonb(superseded), doc_uuid),
         )
 
 

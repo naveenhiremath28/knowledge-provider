@@ -1130,6 +1130,10 @@ class TestUploadCatalogIdentity:
             before["id"], [{"page_number": 1, "original_markdown": "old text"}]
         )
         db_connection.save_chunks(before["id"], [{"chunk_number": 1, "original_text": "old"}])
+        # The first upload's run is still "running"; a replace waits for it to settle.
+        db_connection.update_document_job(
+            db_connection.get_latest_document_job(before["id"])["id"], status="waiting_review"
+        )
 
         second = test_client.post(
             "/upload",
@@ -1167,15 +1171,15 @@ class TestUploadCatalogIdentity:
             assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 2
             assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 2
 
-    @pytest.mark.api
-    @pytest.mark.unit
-    def test_replacing_a_document_needs_access_to_its_tenant(self, db_connection):
-        from fastapi import HTTPException
-
-        import pipeline.api as api
+    @staticmethod
+    def _user(*group_paths):
         from pipeline.auth.jwt import claims_to_user
 
-        db_connection.upsert_document(
+        return claims_to_user({"sub": "u-" + "-".join(group_paths), "groups": list(group_paths)})
+
+    @staticmethod
+    def _mh_doc(db, **extra):
+        doc_uuid = db.upsert_document(
             workflow_id="wf-mh-doc",
             document_id="d-mh",
             filename="a.pdf",
@@ -1183,20 +1187,101 @@ class TestUploadCatalogIdentity:
             group="mh",
             kind="scheme",
             code="pm-kisan",
+            **extra,
         )
-        outsider = claims_to_user(
-            {"sub": "u1", "realm_access": {"roles": ["content_curator"]}, "instances": ["gj"]}
+        # A new document starts with a "running" workflow; settle it so the
+        # document is at rest, as one waiting in review is.
+        db.update_document_job(db.get_latest_document_job(doc_uuid)["id"], status="waiting_review")
+        return doc_uuid
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_replacing_a_document_needs_rights_in_its_group(self, db_connection):
+        from fastapi import HTTPException
+
+        import pipeline.api as api
+
+        self._mh_doc(db_connection)
+        identity = lambda user: api._resolve_document_identity(  # noqa: E731
+            user, "mh", "scheme", "pm-kisan", "a.pdf"
         )
-        insider = claims_to_user(
-            {"sub": "u2", "realm_access": {"roles": ["content_curator"]}, "instances": ["mh"]}
+
+        # Another state, and a view-only member of this one, are both turned away
+        # before anything about the document is revealed.
+        for outsider in (self._user("/states/GJ/contributor"), self._user("/states/MH/view")):
+            with pytest.raises(HTTPException) as exc:
+                identity(outsider)
+            assert exc.value.status_code == 403
+
+        # The same state with a role that can upload and review may replace.
+        kind, code, existing = identity(self._user("/states/MH/contributor"))
+        assert (kind, code, existing["workflow_id"]) == ("scheme", "pm-kisan", "wf-mh-doc")
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_upload_into_a_group_needs_upload_rights_there(self, db_connection):
+        from fastapi import HTTPException
+
+        import pipeline.api as api
+
+        mixed = self._user("/states/MH/contributor", "/states/GJ/view")
+        # Allowed where the user can upload, refused where they only view.
+        api._resolve_document_identity(mixed, "mh", "scheme", "", "new scheme.pdf")
+        with pytest.raises(HTTPException) as exc:
+            api._resolve_document_identity(mixed, "gj", "scheme", "", "new scheme.pdf")
+        assert exc.value.status_code == 403
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_a_disabled_or_running_document_cannot_be_replaced(self, db_connection):
+        from fastapi import HTTPException
+
+        import pipeline.api as api
+
+        db = db_connection
+        contributor = self._user("/states/MH/contributor")
+        doc_uuid = self._mh_doc(db)
+
+        db.create_document_job(doc_uuid, "pipeline", "wf-mh-doc", status="running")
+        with pytest.raises(HTTPException) as exc:
+            api._resolve_document_identity(contributor, "mh", "scheme", "pm-kisan", "a.pdf")
+        assert (exc.value.status_code, "in progress" in exc.value.detail) == (409, True)
+
+        db.update_document_job(db.get_latest_document_job(doc_uuid)["id"], status="waiting_review")
+        db.set_document_disabled("wf-mh-doc", True)
+        with pytest.raises(HTTPException) as exc:
+            api._resolve_document_identity(contributor, "mh", "scheme", "pm-kisan", "a.pdf")
+        assert (exc.value.status_code, "disabled" in exc.value.detail) == (409, True)
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_a_document_live_in_prod_needs_approval_rights_to_replace(self, db_connection):
+        from fastapi import HTTPException
+
+        import pipeline.api as api
+
+        db = db_connection
+        self._mh_doc(db)
+        db.upsert_document_index_status(
+            "wf-mh-doc", "documents-index", doc_id="d-mh", status="indexed"
         )
+        db.update_document_fields("wf-mh-doc")  # no-op, keeps the dev entry only
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET metadata = jsonb_set(metadata, '{index_status,prod}', "
+                "'{\"status\": \"indexed\", \"doc_id\": \"d-mh\"}')"
+            )
 
         with pytest.raises(HTTPException) as exc:
-            api._resolve_document_identity(outsider, "mh", "scheme", "pm-kisan", "a.pdf")
-        assert exc.value.status_code == 404
+            api._resolve_document_identity(
+                self._user("/states/MH/contributor"), "mh", "scheme", "pm-kisan", "a.pdf"
+            )
+        assert exc.value.status_code == 403
 
-        kind, code, existing = api._resolve_document_identity(insider, "mh", "scheme", "pm-kisan", "a.pdf")
-        assert (kind, code, existing["workflow_id"]) == ("scheme", "pm-kisan", "wf-mh-doc")
+        _, _, existing = api._resolve_document_identity(
+            self._user("/states/MH/approver"), "mh", "scheme", "pm-kisan", "a.pdf"
+        )
+        assert existing["workflow_id"] == "wf-mh-doc"
 
     @pytest.mark.api
     @pytest.mark.unit

@@ -596,3 +596,75 @@ class TestDocumentJsonbShape:
             enums = conn.execute("SELECT count(*) AS n FROM pg_type WHERE typtype = 'e'").fetchone()["n"]
         assert len(types) == 5 and set(types.values()) == {"text"}
         assert enums == 0
+
+
+class TestSupersededIndexKeys:
+    """A replaced file changes the index key; the old key must be remembered for cleanup."""
+
+    @staticmethod
+    def _indexed(db, workflow_id, envs):
+        doc_uuid = _doc(db, workflow_id)
+        old_key = db.get_document(workflow_id)["document_id"]
+        for env in envs:
+            index = "prod-index" if env == "prod" else "documents-index"
+            db.upsert_document_index_status(
+                workflow_id, index, doc_id=old_key, chunk_count_indexed=1, status="indexed"
+            )
+        return doc_uuid, old_key
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_reupload_remembers_the_old_key_for_every_index_that_holds_it(
+        self, db_connection, monkeypatch
+    ):
+        db = db_connection
+        monkeypatch.setenv("PROD_VECTOR_DB_COLLECTION_NAME", "prod-index")
+        doc_uuid, old_key = self._indexed(db, "wf-sup", ["dev", "prod"])
+
+        db.reset_document_for_reupload(
+            doc_uuid, filename="n.pdf", filepath="minio://documents/n.pdf", fingerprint="b" * 32
+        )
+
+        assert db.get_document(doc_uuid)["superseded_doc_ids"] == {"dev": [old_key], "prod": [old_key]}
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_only_indexes_that_hold_the_old_key_are_tracked(self, db_connection):
+        db = db_connection
+        doc_uuid, old_key = self._indexed(db, "wf-sup-dev", ["dev"])
+
+        db.reset_document_for_reupload(
+            doc_uuid, filename="n.pdf", filepath="minio://documents/n.pdf", fingerprint="c" * 32
+        )
+
+        assert db.get_document(doc_uuid)["superseded_doc_ids"] == {"dev": [old_key]}
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_the_same_file_again_supersedes_nothing(self, db_connection):
+        db = db_connection
+        doc_uuid, old_key = self._indexed(db, "wf-sup-same", ["dev"])
+
+        db.reset_document_for_reupload(
+            doc_uuid, filename="n.pdf", filepath="minio://documents/n.pdf", fingerprint=old_key
+        )
+
+        assert db.get_document(doc_uuid)["superseded_doc_ids"] == {}
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_two_replacements_keep_both_old_keys_until_cleared(self, db_connection):
+        db = db_connection
+        doc_uuid, first_key = self._indexed(db, "wf-sup-two", ["dev"])
+        db.reset_document_for_reupload(
+            doc_uuid, filename="n.pdf", filepath="minio://documents/n.pdf", fingerprint="d" * 32
+        )
+        # The second version never reached the index, so its key is not tracked.
+        db.reset_document_for_reupload(
+            doc_uuid, filename="m.pdf", filepath="minio://documents/m.pdf", fingerprint="e" * 32
+        )
+        assert db.get_document(doc_uuid)["superseded_doc_ids"] == {"dev": [first_key]}
+
+        db.clear_superseded_doc_ids(doc_uuid, "dev", [first_key])
+
+        assert db.get_document(doc_uuid)["superseded_doc_ids"] == {}
