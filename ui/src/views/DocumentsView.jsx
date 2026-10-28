@@ -6,7 +6,7 @@ import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import { StageBadge } from '../components/StageBadge'
-import { InstanceBadge } from '../components/InstanceBadge'
+import { GroupBadge } from '../components/GroupBadge'
 import { fetchAllDocuments, formatCompactDateTime, getDocumentListLabel, getDocumentMetaLabel, getStageLabel } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
 import { Search, FileText, AlertTriangle, RefreshCw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
@@ -21,7 +21,7 @@ export default function DocumentsView() {
   const [query, setQuery] = useState('')
   const [stageFilter, setStageFilter] = useState('all')
   const [authFilter, setAuthFilter] = useState('all')
-  const [instanceFilter, setInstanceFilter] = useState('all')
+  const [groupFilter, setGroupFilter] = useState('all')
   const [showFailed, setShowFailed] = useState(false)
   const [showReindex, setShowReindex] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -47,8 +47,8 @@ export default function DocumentsView() {
   }
 
   const stageOptions = useMemo(() => ['all', ...new Set(documents.map(doc => doc.stage))], [documents])
-  const instanceOptions = useMemo(() => {
-    const fromDocs = documents.map((d) => (d.instance || '').trim().toLowerCase()).filter(Boolean)
+  const groupOptions = useMemo(() => {
+    const fromDocs = documents.map((d) => (d.group || '').trim().toLowerCase()).filter(Boolean)
     return ['all', ...new Set(fromDocs)]
   }, [documents])
 
@@ -59,26 +59,26 @@ export default function DocumentsView() {
       if (stageFilter !== 'all' && doc.stage !== stageFilter) return false
       if (authFilter === 'authoritative' && !doc.authoritative) return false
       if (authFilter === 'legacy' && doc.authoritative) return false
-      if (instanceFilter !== 'all') {
-        const code = (doc.instance || 'default').trim().toLowerCase()
-        if (code !== instanceFilter) return false
+      if (groupFilter !== 'all') {
+        const code = (doc.group || 'default').trim().toLowerCase()
+        if (code !== groupFilter) return false
       }
       if (showFailed && !doc.failed && doc.stage !== 'failed') return false
       if (showReindex && !doc.reindex_required) return false
       return true
     })
-  }, [documents, query, stageFilter, authFilter, instanceFilter, showFailed, showReindex])
+  }, [documents, query, stageFilter, authFilter, groupFilter, showFailed, showReindex])
 
   useEffect(() => {
     setPage(1)
-  }, [query, stageFilter, authFilter, instanceFilter, showFailed, showReindex])
+  }, [query, stageFilter, authFilter, groupFilter, showFailed, showReindex])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
   const activeFilters = [
     stageFilter !== 'all' && `Stage: ${getStageLabel(stageFilter, { compact: true })}`,
     authFilter !== 'all' && `Type: ${authFilter}`,
-    instanceFilter !== 'all' && `State: ${instanceFilter.toUpperCase()}`,
+    groupFilter !== 'all' && `State: ${groupFilter.toUpperCase()}`,
     showFailed && 'Failed only',
     showReindex && 'Reindex required',
   ].filter(Boolean)
@@ -142,14 +142,14 @@ export default function DocumentsView() {
             <SelectItem value="legacy">Legacy</SelectItem>
           </SelectContent>
         </Select>
-        {isSuperAdmin && instanceOptions.length > 1 ? (
-          <Select value={instanceFilter} onValueChange={setInstanceFilter}>
+        {isSuperAdmin && groupOptions.length > 1 ? (
+          <Select value={groupFilter} onValueChange={setGroupFilter}>
             <SelectTrigger className="w-[140px]">
               <SelectValue placeholder="State" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All states</SelectItem>
-              {instanceOptions
+              {groupOptions
                 .filter((s) => s !== 'all')
                 .map((code) => (
                   <SelectItem key={code} value={code}>
@@ -178,7 +178,7 @@ export default function DocumentsView() {
             onClick={() => {
               setStageFilter('all')
               setAuthFilter('all')
-              setInstanceFilter('all')
+              setGroupFilter('all')
               setShowFailed(false)
               setShowReindex(false)
               setQuery('')
@@ -233,7 +233,7 @@ export default function DocumentsView() {
                       <div className="text-xs text-muted-foreground font-mono truncate">{getDocumentMetaLabel(doc)}</div>
                     </td>
                     <td className="px-4 py-3">
-                      <InstanceBadge instance={doc.instance} />
+                      <GroupBadge group={doc.group} />
                     </td>
                     <td className="px-4 py-3"><StageBadge stage={doc.stage} compact /></td>
                     <td className="px-4 py-3">

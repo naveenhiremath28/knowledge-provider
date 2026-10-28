@@ -5,7 +5,7 @@ import { Skeleton } from '../components/ui/skeleton'
 import { StatCard } from '../components/StatCard'
 import { StageBadge } from '../components/StageBadge'
 import { fetchJson, formatCount, getDocumentListLabel, summarizeQueueReason } from '../lib/pipelineUi'
-import { formatInstanceLabel } from '../lib/instanceLabels'
+import { formatGroupLabel } from '../lib/groupLabels'
 import { useAuth } from '../auth/AuthProvider'
 import { AlertTriangle, CheckCircle, FileText, Globe2, ListTodo } from 'lucide-react'
 
@@ -66,8 +66,8 @@ export default function DashboardView() {
   const reindexCount = summary?.needs_reindex || 0
   const displayedQueueItems = queue.slice(0, QUEUE_ROWS_SHOWN)
 
-  const byInstance = useMemo(() => (Array.isArray(summary?.by_instance) ? summary.by_instance : []), [summary])
-  const stateRows = byInstance
+  const byGroup = useMemo(() => (Array.isArray(summary?.by_group) ? summary.by_group : []), [summary])
+  const stateRows = byGroup
 
   const maxStateCount = useMemo(
     () => stateRows.reduce((max, item) => Math.max(max, item.count || 0), 0),
@@ -113,7 +113,7 @@ export default function DashboardView() {
         />
         <StatCard
           label="Total States"
-          value={formatCount(byInstance.length)}
+          value={formatCount(byGroup.length)}
           icon={<Globe2 className="h-4 w-4" />}
         />
         <StatCard
@@ -172,10 +172,10 @@ export default function DashboardView() {
               {stateRows.map((row) => {
                 const label = row.otherStateCount
                   ? `Others (${row.otherStateCount} states)`
-                  : formatInstanceLabel(row.instance) || 'No state tag'
+                  : formatGroupLabel(row.group) || 'No state tag'
                 const pct = (value) => (maxStateCount ? (value / maxStateCount) * 100 : 0)
                 return (
-                  <div key={row.instance}>
+                  <div key={row.group}>
                     <div className="flex items-center justify-between mb-1.5">
                       <span className="text-sm font-medium text-foreground">{label}</span>
                       <span className="text-sm font-medium text-foreground">{formatCount(row.count)}</span>

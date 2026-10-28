@@ -166,7 +166,7 @@ export default function ChunkExplorerView() {
     const groups = new Map()
     chunks.forEach(chunk => {
       const key = chunk.workflow_id || '__unknown__'
-      const label = chunk.display_name || chunk.filename || key
+      const label = chunk.name || chunk.filename || key
       const existing = groups.get(key) || { key, label, chunks: [] }
       existing.chunks.push(chunk)
       groups.set(key, existing)
@@ -401,7 +401,7 @@ export default function ChunkExplorerView() {
                       openDocumentChunks(chunk.workflow_id)
                     }}
                   >
-                    {chunk.display_name || chunk.filename || chunk.workflow_id}
+                    {chunk.name || chunk.filename || chunk.workflow_id}
                   </button>
                   <p className="text-xs text-muted-foreground">
                     Chunk {chunk.chunk_number} · Pages {chunk.page_start}–{chunk.page_end} · {getStageLabel(chunk.stage)}

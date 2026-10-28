@@ -1,13 +1,13 @@
 /**
- * Plan 2: display labels for documents.instance (state / portal tag).
+ * Plan 2: display labels for the document group (state / portal tag).
  * Authorization still comes from Keycloak JWT — this is UI only.
  */
 
-export const PORTAL_INSTANCE = 'bv'
+export const PORTAL_GROUP = 'bv'
 
 /** Short badge label: mh → MH, bv → BV */
-export function formatInstanceLabel(instance) {
-  const code = String(instance || '')
+export function formatGroupLabel(group) {
+  const code = String(group || '')
     .trim()
     .toLowerCase()
   if (!code || code === 'default') return null
@@ -17,8 +17,8 @@ export function formatInstanceLabel(instance) {
   return code.toUpperCase()
 }
 
-export function instanceBadgeTitle(instance) {
-  const code = String(instance || '')
+export function groupBadgeTitle(group) {
+  const code = String(group || '')
     .trim()
     .toLowerCase()
   if (!code || code === 'default') return 'No state tag'
@@ -29,11 +29,11 @@ export function instanceBadgeTitle(instance) {
 }
 
 /**
- * Default instance for upload form.
+ * Default group for upload form.
  * Super admin → portal (bv); single state → that state; multi → first (user can change).
  */
-export function defaultUploadInstance({ isSuperAdmin, instances = [], portalInstance = PORTAL_INSTANCE }) {
-  if (isSuperAdmin) return portalInstance || PORTAL_INSTANCE
+export function defaultUploadGroup({ isSuperAdmin, instances = [], portalGroup = PORTAL_GROUP }) {
+  if (isSuperAdmin) return portalGroup || PORTAL_GROUP
   const list = (instances || []).map((i) => String(i).trim().toLowerCase()).filter(Boolean)
   if (list.length >= 1) return list[0]
   return ''

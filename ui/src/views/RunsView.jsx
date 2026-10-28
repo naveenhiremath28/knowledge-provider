@@ -4,7 +4,7 @@ import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Skeleton } from '../components/ui/skeleton'
 import { StageBadge } from '../components/StageBadge'
-import { InstanceBadge } from '../components/InstanceBadge'
+import { GroupBadge } from '../components/GroupBadge'
 import PipelineStepper from '../components/PipelineStepper'
 import {
   fetchJson,
@@ -356,7 +356,7 @@ export default function RunsView() {
                             {title}
                           </button>
                           <div className="flex flex-wrap items-center gap-1.5">
-                            <InstanceBadge instance={run.instance} />
+                            <GroupBadge group={run.group} />
                             <span className="truncate font-mono text-[10px] text-muted-foreground">
                               #{runId}
                               {fileLabel && fileLabel !== title ? ` · ${fileLabel}` : ''}

@@ -22,12 +22,17 @@ import {
 import { API_BASE } from '../config'
 import { apiFetch } from '../auth/keycloak'
 import { useAuth } from '../auth/AuthProvider'
-import { defaultUploadInstance, PORTAL_INSTANCE } from '../lib/instanceLabels'
+import { defaultUploadGroup, PORTAL_GROUP } from '../lib/groupLabels'
 import { fetchJson, formatCompactDateTime, getDocumentListLabel, summarizeIngestStatus } from '../lib/pipelineUi'
 
 const SUPPORTED_TYPES = ['.pdf', '.doc', '.docx']
 const MAX_SIZE_MB = 100
 const FILE_TYPE_CHIPS = ['PDF', 'Word']
+// The catalog a document joins is (your group, type), so the type is chosen up front.
+const DOCUMENT_TYPE_OPTIONS = [
+  { value: 'scheme', label: 'Scheme' },
+  { value: 'advisory', label: 'Advisory' },
+]
 
 const PIPELINE_STEPS = [
   { id: 'ocr', label: 'OCR', icon: ScanText },
@@ -53,13 +58,14 @@ export default function NewDocumentView() {
   const navigate = useNavigate()
   const { hasPermission, instances, isSuperAdmin, user } = useAuth()
   const canUpload = hasPermission('upload')
-  // Instance from login (Keycloak) — not user-selected on this form.
-  const documentInstance = defaultUploadInstance({
+  // Group from login (Keycloak) — not user-selected on this form.
+  const documentGroup = defaultUploadGroup({
     isSuperAdmin,
     instances,
-    portalInstance: user?.portal_instance || PORTAL_INSTANCE,
+    portalGroup: user?.portal_group || PORTAL_GROUP,
   })
   const [file, setFile] = useState(null)
+  const [documentKind, setDocumentKind] = useState('')
   const [dragging, setDragging] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState(false)
@@ -120,8 +126,8 @@ export default function NewDocumentView() {
   }
 
   async function handleSubmit() {
-    if (!file || !canUpload) return
-    if (!documentInstance && !isSuperAdmin) {
+    if (!file || !documentKind || !canUpload) return
+    if (!documentGroup && !isSuperAdmin) {
       setUploadError(
         'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/admin).',
       )
@@ -133,8 +139,8 @@ export default function NewDocumentView() {
       const formData = new FormData()
       formData.append('file', file)
       // State users: Keycloak group state only. Super-admin: portal BV when unset.
-      const uploadInstance = documentInstance || (isSuperAdmin ? PORTAL_INSTANCE : '')
-      if (!uploadInstance) {
+      const uploadGroup = documentGroup || (isSuperAdmin ? PORTAL_GROUP : '')
+      if (!uploadGroup) {
         setUploadError(
           'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/admin).',
         )
@@ -142,7 +148,8 @@ export default function NewDocumentView() {
       }
       const params = new URLSearchParams({
         auto_approve: 'false',
-        instance: uploadInstance,
+        group: uploadGroup,
+        kind: documentKind,
       })
       const response = await apiFetch(`${API_BASE}/upload?${params}`, { method: 'POST', body: formData })
       const data = await response.json()
@@ -161,6 +168,7 @@ export default function NewDocumentView() {
     setFile(null)
     setUploadSuccess(false)
     setLastWorkflowId('')
+    setDocumentKind('')
     setUploadError('')
     setValidationError('')
   }
@@ -222,6 +230,26 @@ export default function NewDocumentView() {
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-12 lg:gap-4">
         {/* Left column */}
         <div className="flex min-w-0 flex-col gap-3 lg:col-span-8">
+          <div className="flex flex-wrap items-center gap-2">
+            <label htmlFor="document-kind" className="text-xs font-medium text-foreground">
+              Document type
+            </label>
+            <select
+              id="document-kind"
+              className="rounded-md border border-input bg-background px-3 py-1 text-xs"
+              value={documentKind}
+              disabled={!canUpload}
+              onChange={(event) => setDocumentKind(event.target.value)}
+            >
+              <option value="">Select type…</option>
+              {DOCUMENT_TYPE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-muted-foreground">Required</span>
+          </div>
           <div
             className={[
               'rounded-xl border-2 border-dashed bg-card transition-colors',
@@ -355,7 +383,7 @@ export default function NewDocumentView() {
           <Button
             className="h-10 w-full text-sm font-medium sm:w-auto sm:min-w-[200px]"
             onClick={handleSubmit}
-            disabled={!file || uploading || !canUpload}
+            disabled={!file || !documentKind || uploading || !canUpload}
           >
             {uploading ? (
               <>

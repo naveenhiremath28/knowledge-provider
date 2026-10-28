@@ -366,11 +366,11 @@ export function AuthProvider({ children }) {
   )
 
   /** Role for a state tenant (mh, up, …). Super-admin always returns super_admin. */
-  const roleForInstance = useCallback(
-    (instance) => {
+  const roleForGroup = useCallback(
+    (group) => {
       if (!AUTH_ENABLED || isSuperAdmin) return 'super_admin'
-      if (!instance) return null
-      const key = String(instance).trim().toLowerCase()
+      if (!group) return null
+      const key = String(group).trim().toLowerCase()
       // A BH viewer holds no per-state group but reads every state.
       return stateRoles[key] || (isBhViewer ? 'state_view' : null)
     },
@@ -378,11 +378,11 @@ export function AuthProvider({ children }) {
   )
 
   /** Whether the user may see a tenant (state). Super-admin → all. */
-  const canAccessInstance = useCallback(
-    (instance) => {
+  const canAccessGroup = useCallback(
+    (group) => {
       if (!AUTH_ENABLED || isSuperAdmin || isBhViewer) return true
-      if (!instance) return false
-      const key = String(instance).trim().toLowerCase()
+      if (!group) return false
+      const key = String(group).trim().toLowerCase()
       if (instances.length === 0) return false
       return instances.map((i) => String(i).toLowerCase()).includes(key)
     },
@@ -397,17 +397,17 @@ export function AuthProvider({ children }) {
    * may approve OCR / translation / chunking) but NOT 'approve_ingestion'
    * (it may not publish to DEV).
    */
-  const hasPermissionForInstance = useCallback(
-    (perm, instance) => {
+  const hasPermissionForGroup = useCallback(
+    (perm, group) => {
       if (!AUTH_ENABLED) return true
       if (isSuperAdmin) return hasPermission(perm)
-      const role = normalizeProductRole(roleForInstance(instance))
+      const role = normalizeProductRole(roleForGroup(group))
       if (!role) return false
       // Platform-level capabilities are never granted by a state role.
       if (perm === 'admin' || perm === 'manage_users') return false
       return roleGrants(role, perm)
     },
-    [hasPermission, isSuperAdmin, roleForInstance],
+    [hasPermission, isSuperAdmin, roleForGroup],
   )
 
   const value = useMemo(
@@ -432,10 +432,10 @@ export function AuthProvider({ children }) {
       isSuperAdmin,
       isBhViewer,
       hasPermission,
-      hasPermissionForInstance,
+      hasPermissionForGroup,
       hasRole,
-      roleForInstance,
-      canAccessInstance,
+      roleForGroup,
+      canAccessGroup,
       loginWithSso,
       loginWithOtpTokens,
       logout,
@@ -460,10 +460,10 @@ export function AuthProvider({ children }) {
       isSuperAdmin,
       isBhViewer,
       hasPermission,
-      hasPermissionForInstance,
+      hasPermissionForGroup,
       hasRole,
-      roleForInstance,
-      canAccessInstance,
+      roleForGroup,
+      canAccessGroup,
       loginWithSso,
       loginWithOtpTokens,
       logout,

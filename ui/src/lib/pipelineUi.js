@@ -206,7 +206,7 @@ export const DEFAULT_SEARCH_SETTINGS = {
 
 export function getDocumentListLabel(doc) {
   return (
-    doc?.display_name ||
+    doc?.name ||
     doc?.name_en ||
     doc?.name ||
     doc?.filename ||
