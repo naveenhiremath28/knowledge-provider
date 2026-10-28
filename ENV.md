@@ -242,7 +242,7 @@ Exposes `/catalog/v1/*` so **bharat-oan-api** and **bharat-provider-backend** ca
 | `PROD_SCHEME_VECTOR_DB_API_KEY` | `PROD_VECTOR_DB_API_KEY` | Scheme collection API key |
 | `PROD_SCHEME_VECTOR_DB_COLLECTION_NAME` | `schemes-index` | Must **not** equal documents collection |
 
-**Endpoints:** `GET /catalog/v1/snapshot`, `/version`, `/schemes`, `/tool-prompt`; `POST /catalog/v1/rebuild`, `/bootstrap`; `PATCH /documents/{id}/scheme-metadata`.
+**Endpoints:** `GET /catalog/v1/snapshot`, `/version`, `/schemes`, `/tool-prompt`; `POST /catalog/v1/rebuild`; `PATCH /documents/{id}/scheme-metadata` (body: `kind`, `code`, `name`, `aliases`, `tool_routing`, `catalog_visible`, `network_visible`, `valid_from`, `valid_to`). The catalog is computed from documents (one row per document), so there is no bootstrap endpoint. `/upload`, `/documents` and `/documents/batch` take a required `kind` (`scheme` or `advisory`) and an optional `group` and `code`.
 
 ### Publish to Network
 

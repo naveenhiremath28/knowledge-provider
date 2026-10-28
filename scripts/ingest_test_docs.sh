@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Ingest all PDFs from ~/test-docs via H100 pipeline API.
+# DOC_KIND: scheme (default) or advisory. PIPELINE_GROUP: tenant group code (optional).
 set -euo pipefail
 
 DOCS_DIR="${1:-$HOME/test-docs}"
 API="${PIPELINE_API:-http://127.0.0.1:8001}"
+DOC_KIND="${DOC_KIND:-scheme}"
+QUERY="auto_approve=true&kind=${DOC_KIND}"
+if [[ -n "${PIPELINE_GROUP:-}" ]]; then
+  QUERY="${QUERY}&group=${PIPELINE_GROUP}"
+fi
 
 if [[ ! -d "$DOCS_DIR" ]]; then
   echo "Missing directory: $DOCS_DIR"
@@ -18,7 +24,7 @@ if [[ ${#pdfs[@]} -eq 0 ]]; then
 fi
 
 echo "API: $API"
-echo "Files: ${#pdfs[@]}"
+echo "Files: ${#pdfs[@]}  kind: $DOC_KIND"
 curl -sf "$API/health" | python3 -m json.tool || { echo "API not reachable"; exit 1; }
 echo ""
 
@@ -26,7 +32,7 @@ for f in "${pdfs[@]}"; do
   name="$(basename "$f")"
   echo "========================================"
   echo "UPLOAD: $name"
-  resp="$(curl -s -X POST "$API/upload?auto_approve=true" -F "file=@$f")"
+  resp="$(curl -s -X POST "$API/upload?$QUERY" -F "file=@$f")"
   echo "$resp" | python3 -m json.tool || echo "$resp"
   wf="$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workflow_id',''))" 2>/dev/null || true)"
   if [[ -n "$wf" ]]; then

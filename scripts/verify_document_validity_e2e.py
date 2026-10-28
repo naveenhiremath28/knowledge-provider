@@ -75,6 +75,9 @@ def make_document(workflow_id, text, valid_from=None, valid_to=None, legacy=Fals
         stage="chunk_review",
         valid_from=valid_from,
         valid_to=valid_to,
+        group="bv",
+        kind="scheme",
+        code=workflow_id,
     )
     if legacy:
         # A document that predates the columns: NULL, as the migration leaves it.
@@ -87,7 +90,7 @@ def make_document(workflow_id, text, valid_from=None, valid_to=None, legacy=Fals
         filename=f"{workflow_id}.pdf",
         chunks=chunks,
         workflow_id=workflow_id,
-        instance="bv",
+        group="bv",
         **kwargs,
     )
 
@@ -228,7 +231,7 @@ again = _prepare_records(
     filename="wf-active.pdf",
     chunks=[{"chunk_number": 1, "original_text": "Kisan credit card subsidy for active season", "token_count": 8}],
     workflow_id="wf-active",
-    instance="bv",
+    group="bv",
     **_validity_fields_from_doc(doc),
 )
 store.upsert(COLLECTION, again, batch_size=8)

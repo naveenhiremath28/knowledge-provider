@@ -2,6 +2,10 @@
 # Prerequisite: ssh -L 18001:127.0.0.1:8001 -N docs-pipeline-host
 $ErrorActionPreference = "Stop"
 $Api = if ($env:PIPELINE_API) { $env:PIPELINE_API } else { "http://127.0.0.1:18001" }
+# DOC_KIND: scheme (default) or advisory. PIPELINE_GROUP: tenant group code (optional).
+$Kind = if ($env:DOC_KIND) { $env:DOC_KIND } else { "scheme" }
+$Query = "auto_approve=true&kind=$Kind"
+if ($env:PIPELINE_GROUP) { $Query = "$Query&group=$($env:PIPELINE_GROUP)" }
 $DocsDir = Join-Path $PSScriptRoot ".." "test docs" | Resolve-Path
 
 Write-Host "API: $Api"
@@ -31,7 +35,7 @@ Get-ChildItem -Path $DocsDir -Filter "*.pdf" | ForEach-Object {
   )
   $body = $bodyLines -join $LF
   $bodyBytes = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetBytes($body)
-  $resp = Invoke-RestMethod -Uri "$Api/upload?auto_approve=true" -Method Post `
+  $resp = Invoke-RestMethod -Uri "$Api/upload?$Query" -Method Post `
     -ContentType "multipart/form-data; boundary=$boundary" -Body $bodyBytes
   $resp | ConvertTo-Json -Depth 5
 }

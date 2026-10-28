@@ -37,10 +37,17 @@ def check_health(name: str, url: str) -> bool:
         return False
 
 
-def upload_pdf(api: str, pdf_path: Path, *, auto_approve: bool, stop_after_ocr: bool) -> str:
+def upload_pdf(
+    api: str, pdf_path: Path, *, auto_approve: bool, stop_after_ocr: bool, kind: str, group: str = ""
+) -> str:
     import subprocess
 
-    query = f"auto_approve={'true' if auto_approve else 'false'}&stop_after_ocr={'true' if stop_after_ocr else 'false'}"
+    query = (
+        f"auto_approve={'true' if auto_approve else 'false'}"
+        f"&stop_after_ocr={'true' if stop_after_ocr else 'false'}&kind={kind}"
+    )
+    if group:
+        query += f"&group={group}"
     url = f"{api.rstrip('/')}/upload?{query}"
     result = subprocess.run(
         ["curl", "-sf", "-X", "POST", url, "-F", f"file=@{pdf_path}"],
@@ -92,6 +99,8 @@ def main() -> int:
     parser.add_argument("--chandra-health", default=os.environ.get("CHANDRA_HEALTH_URL", "http://127.0.0.1:8010/health"))
     parser.add_argument("--gemma-health", default=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"))
     parser.add_argument("--mode", choices=["ocr", "full"], default="ocr", help="ocr=stop after OCR; full=entire pipeline")
+    parser.add_argument("--kind", choices=["scheme", "advisory"], default="scheme", help="Document kind (catalog)")
+    parser.add_argument("--group", default="", help="Tenant group code (optional; defaults to your group)")
     parser.add_argument("--timeout", type=int, default=1800, help="Max seconds to wait for workflow")
     parser.add_argument("--poll-interval", type=float, default=5.0)
     args = parser.parse_args()
@@ -121,7 +130,10 @@ def main() -> int:
 
     stop_after_ocr = args.mode == "ocr"
     print(f"==> Upload ({'OCR only' if stop_after_ocr else 'full pipeline'})")
-    workflow_id = upload_pdf(args.api, args.pdf, auto_approve=True, stop_after_ocr=stop_after_ocr)
+    workflow_id = upload_pdf(
+        args.api, args.pdf, auto_approve=True, stop_after_ocr=stop_after_ocr,
+        kind=args.kind, group=args.group,
+    )
 
     print("==> Polling workflow")
     doc = poll_document(args.api, workflow_id, timeout_seconds=args.timeout, interval=args.poll_interval)

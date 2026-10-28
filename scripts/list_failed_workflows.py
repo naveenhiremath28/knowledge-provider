@@ -95,7 +95,7 @@ async def get_temporal_error_details(workflow_id: str, client: Client) -> dict:
 def query_failed_workflows_from_db() -> list:
     """Query the database for failed workflows (including demo and disabled documents)."""
     return db.list_documents(
-        stage="failed", limit=1_000_000, include_demo=True, include_disabled=True
+        stage="failed", limit=1_000_000, include_disabled=True
     )
 
 
