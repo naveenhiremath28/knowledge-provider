@@ -1083,7 +1083,9 @@ class TestUploadCatalogIdentity:
         assert doc["name"] == "National Mission on Natural Farming"
         with db_connection.get_connection() as conn:
             catalog = conn.execute(
-                "SELECT c.type, g.name, g.path FROM catalogs c JOIN groups g ON g.id = c.group_id"
+                "SELECT c.type, g.name, g.path FROM documents d JOIN catalogs c ON c.id = d.catalog_id "
+                "JOIN groups g ON g.id = c.group_id WHERE d.code = %s",
+                (doc["code"],),
             ).fetchall()
         assert [(r["type"], r["name"], r["path"]) for r in catalog] == [
             ("openagrinet:AgricultureResource", "mh", "/states/MH")
@@ -1112,7 +1114,7 @@ class TestUploadCatalogIdentity:
         }
         assert codes == {"ca", "ca-2"}
         with db_connection.get_connection() as conn:
-            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 1
+            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 3  # seeded with the group
 
     @pytest.mark.api
     @pytest.mark.unit
@@ -1169,7 +1171,7 @@ class TestUploadCatalogIdentity:
 
         with db_connection.get_connection() as conn:
             assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 2
-            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 2
+            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == 6  # 3 per group
 
     @staticmethod
     def _user(*group_paths):

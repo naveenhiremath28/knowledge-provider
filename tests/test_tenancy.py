@@ -398,12 +398,14 @@ def test_group_is_reached_through_the_documents_catalog(db_connection):
         "tenant-a": "/states/TENANT-A",
         PORTAL_GROUP: "/global" if PORTAL_GROUP == "bv" else f"/states/{PORTAL_GROUP.upper()}",
     }
-    # One catalog per (group, type): tenant-a has scheme + advisory, the portal only scheme.
-    assert sorted((r["group_name"], r["type"]) for r in catalogs) == sorted([
-        ("tenant-a", "openagrinet:AgricultureResource"),
-        ("tenant-a", "openagrinet:KnowledgeAdvisory"),
-        (PORTAL_GROUP, "openagrinet:AgricultureResource"),
-    ])
+    # Every group is seeded with one catalog per supported type.
+    from pipeline.network_constants import KIND_TO_CATALOG_TYPE
+
+    assert sorted((r["group_name"], r["type"]) for r in catalogs) == sorted(
+        (group, catalog_type)
+        for group in ("tenant-a", PORTAL_GROUP)
+        for catalog_type in KIND_TO_CATALOG_TYPE.values()
+    )
     assert db.get_document("wf-g-a")["group"] == "tenant-a"
     assert db.get_document("wf-g-adv")["kind"] == "advisory"
     assert {d["workflow_id"] for d in db.list_documents(groups=["tenant-a"])} == {"wf-g-a", "wf-g-adv"}

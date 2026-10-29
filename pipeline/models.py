@@ -257,9 +257,8 @@ class SchemeMetadataUpdate(BaseModel):
     period is part of classifying a document, not a separate errand. Omitting
     both leaves the stored period alone; the dates are validated in
     `document_validity.parse_period` so a bad period comes back as the same
-    400 a bad kind does, not a Pydantic 422.
+    400 other bad input does, not a Pydantic 422.
     """
-    kind: Optional[str] = None  # scheme | advisory
     code: Optional[str] = None
     name: Optional[str] = None
     aliases: Optional[list[str]] = None

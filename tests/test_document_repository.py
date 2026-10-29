@@ -81,10 +81,18 @@ class TestAgainstRealPostgres:
 
     @pytest.mark.unit
     @pytest.mark.db
-    def test_reads_a_kind_written_through_the_db_layer(self, db_connection, scheme_document):
-        db_connection.update_document_fields(scheme_document, kind="advisory")
+    def test_reads_a_kind_written_through_the_db_layer(self, db_connection):
+        db_connection.upsert_document(
+            workflow_id="repo-wf-adv",
+            document_id="repo-doc-adv",
+            filename="adv.pdf",
+            filepath="/app/books/adv.pdf",
+            stage="registered",
+            kind="advisory",
+            code="repo-advisory",
+        )
 
-        assert DocumentRepository().get_document_kind(scheme_document) == "advisory"
+        assert DocumentRepository().get_document_kind("repo-wf-adv") == "advisory"
 
     @pytest.mark.unit
     @pytest.mark.db

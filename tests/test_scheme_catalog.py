@@ -69,7 +69,6 @@ def test_scheme_metadata_and_promote_rebuild(catalog_db):
     _doc(db, "wf-pkvy-1", code="pkvy")
     result = scheme_catalog.apply_scheme_metadata(
         "wf-pkvy-1",
-        kind="scheme",
         code="pkvy",
         name="Paramparagat Krishi Vikas Yojana",
         aliases=["PKVY", "organic"],
@@ -145,7 +144,6 @@ def test_apply_scheme_metadata_keeps_the_code_when_only_the_name_changes(catalog
     _doc(db, "wf-name-only", code="gn", stage="ready_for_ingestion")
     result = scheme_catalog.apply_scheme_metadata(
         "wf-name-only",
-        kind="scheme",
         name="National Mission on Natural Farming",
     )
     assert result["document"]["code"] == "gn"
@@ -153,25 +151,14 @@ def test_apply_scheme_metadata_keeps_the_code_when_only_the_name_changes(catalog
     assert result["code_renamed"] is False
 
 
-def test_kind_is_limited_to_the_known_kinds(catalog_db):
+def test_kind_is_fixed_after_upload(catalog_db):
     db, scheme_catalog = catalog_db
     _doc(db, "wf-kind", code="kind-doc", stage="ready_for_ingestion")
-    assert db.get_document("wf-kind")["kind"] == "scheme"
-
-    result = scheme_catalog.apply_scheme_metadata("wf-kind", kind="advisory")
-    assert result["document"]["kind"] == "advisory"
-    assert result["document"]["code"] == "kind-doc"  # moved catalogs, kept its code
-
-    result = scheme_catalog.apply_scheme_metadata("wf-kind", kind="video")
-    assert result["document"]["kind"] == "video"
-
-    result = scheme_catalog.apply_scheme_metadata("wf-kind", kind="scheme")
+    result = scheme_catalog.apply_scheme_metadata("wf-kind", name="Renamed")
     assert result["document"]["kind"] == "scheme"
-
-    for bad in ("how_to_faq", "document", "podcast", "Not Valid!!"):
-        with pytest.raises(ValueError):
-            scheme_catalog.apply_scheme_metadata("wf-kind", kind=bad)
     assert db.get_document("wf-kind")["kind"] == "scheme"
+    with pytest.raises(TypeError):
+        scheme_catalog.apply_scheme_metadata("wf-kind", kind="advisory")
 
 
 def test_prepare_records_scheme_payload():
@@ -327,12 +314,16 @@ def test_scheme_metadata_api(asgi_client):
     assert "MIF" in body["aliases"]
 
 
-def test_scheme_metadata_api_rejects_an_unknown_kind(asgi_client):
+def test_scheme_metadata_api_ignores_a_kind_in_the_body(asgi_client):
     from pipeline import db
 
-    _doc(db, "wf-meta-bad", code="meta-bad", stage="chunk_review")
-    r = asgi_client.patch("/documents/wf-meta-bad/scheme-metadata", json={"kind": "podcast"})
-    assert r.status_code == 400
+    _doc(db, "wf-meta-kind", code="meta-kind", stage="chunk_review")
+    r = asgi_client.patch(
+        "/documents/wf-meta-kind/scheme-metadata", json={"kind": "advisory", "name": "Still a scheme"}
+    )
+    assert r.status_code == 200
+    assert r.json()["kind"] == "scheme"
+    assert r.json()["name"] == "Still a scheme"
 
 
 @pytest.mark.parametrize("kind", ["scheme", "advisory", "video"])

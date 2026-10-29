@@ -41,7 +41,7 @@ from .models import (
     ResultSettings,
     RetrievalSettings,
 )
-from .network_constants import catalog_type_for_kind, kind_for_catalog_type
+from .network_constants import KIND_TO_CATALOG_TYPE, catalog_type_for_kind, kind_for_catalog_type
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,9 @@ def init_db() -> None:
     current = migrate.current_version(database_url())
     logger.info("db migrations current=%s applied_now=%s", current, applied)
     get_pool()
+    created = sync_catalogs_for_all_groups()
+    if created:
+        logger.info("catalog sync created %d missing catalogs", created)
 
 
 def check_health() -> dict:
@@ -440,7 +443,8 @@ def upsert_group(path: str, keycloak_group_id: Optional[str] = None, conn=None) 
     """Create or refresh the ``groups`` row for a Keycloak group path; returns its UUID.
 
     Rows made by the SQLite move have no Keycloak id yet; the first sync that
-    sees the path fills it in.
+    sees the path fills it in. The group's catalogs (one per supported type) are
+    ensured in the same transaction, so a group never exists without them.
     """
     if conn is None:
         with get_connection() as own:
@@ -454,7 +458,9 @@ def upsert_group(path: str, keycloak_group_id: Optional[str] = None, conn=None) 
         """,
         (keycloak_group_id, _tenant_code_from_path(path), path),
     ).fetchone()
-    return str(row["id"])
+    group_id = str(row["id"])
+    ensure_group_catalogs(group_id, conn=conn)
+    return group_id
 
 
 def get_or_create_group(group: Optional[str], conn=None) -> str:
@@ -463,8 +469,54 @@ def get_or_create_group(group: Optional[str], conn=None) -> str:
     return upsert_group(_tenant_path(code), conn=conn)
 
 
+def _catalog_seed_rows() -> tuple[list[str], list[str]]:
+    """Parallel ``(types, kinds)`` lists for every supported catalog type."""
+    kinds = list(KIND_TO_CATALOG_TYPE)
+    return [KIND_TO_CATALOG_TYPE[k] for k in kinds], kinds
+
+
+def ensure_group_catalogs(group_id: str, conn=None) -> None:
+    """Create the group's missing catalogs, one per supported type; existing rows are untouched."""
+    if conn is None:
+        with get_connection() as own:
+            return ensure_group_catalogs(group_id, conn=own)
+    types, kinds = _catalog_seed_rows()
+    conn.execute(
+        """
+        INSERT INTO catalogs (group_id, type, name)
+        SELECT g.id, t.type, upper(g.name) || ' ' || t.kind || ' catalog'
+        FROM groups g, unnest(%s::text[], %s::text[]) AS t(type, kind)
+        WHERE g.id = %s::uuid
+        ON CONFLICT (group_id, type) DO NOTHING
+        """,
+        (types, kinds, group_id),
+    )
+
+
+def sync_catalogs_for_all_groups(conn=None) -> int:
+    """Add every missing ``(group, type)`` catalog; returns how many rows were created.
+
+    Idempotent. Run at startup so a type added to the kind map reaches groups
+    that already exist.
+    """
+    if conn is None:
+        with get_connection() as own:
+            return sync_catalogs_for_all_groups(conn=own)
+    types, kinds = _catalog_seed_rows()
+    cur = conn.execute(
+        """
+        INSERT INTO catalogs (group_id, type, name)
+        SELECT g.id, t.type, upper(g.name) || ' ' || t.kind || ' catalog'
+        FROM groups g, unnest(%s::text[], %s::text[]) AS t(type, kind)
+        ON CONFLICT (group_id, type) DO NOTHING
+        """,
+        (types, kinds),
+    )
+    return cur.rowcount
+
+
 def get_or_create_catalog(group_id: str, kind: str, conn=None) -> dict:
-    """The ``(group, kind)`` catalog row, created with a default name when missing."""
+    """The ``(group, kind)`` catalog row; created when missing (normally seeded with the group)."""
     if conn is None:
         with get_connection() as own:
             return get_or_create_catalog(group_id, kind, conn=own)
@@ -472,7 +524,7 @@ def get_or_create_catalog(group_id: str, kind: str, conn=None) -> dict:
     row = conn.execute(
         """
         INSERT INTO catalogs (group_id, type, name)
-        SELECT g.id, %s, g.name || ' ' || %s FROM groups g WHERE g.id = %s::uuid
+        SELECT g.id, %s, upper(g.name) || ' ' || %s || ' catalog' FROM groups g WHERE g.id = %s::uuid
         ON CONFLICT (group_id, type) DO UPDATE SET type = EXCLUDED.type
         RETURNING id, group_id, type, name, metadata
         """,
@@ -1609,7 +1661,7 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
 
     Flat names are mapped onto the tables: ``stage``/``error_message`` act on the
     current workflow, ``code``/``name``/``aliases`` on the document columns,
-    ``kind`` moves the document to the group's catalog of that kind, and flags,
+    a document's kind is fixed by its catalog at upload, and flags,
     period and uploader go into ``metadata``. Names derived from other rows (counts, artifact and job
     pointers, completion timestamps) are accepted and ignored.
     """
@@ -1687,19 +1739,6 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
                         updates.get("uploaded_by_roles"),
                         conn=conn,
                     )
-
-        if updates.get("kind"):
-            current = conn.execute(
-                "SELECT c.group_id, c.type FROM documents d JOIN catalogs c ON c.id = d.catalog_id "
-                "WHERE d.id = %s::uuid",
-                (doc_uuid,),
-            ).fetchone()
-            if current["type"] != catalog_type_for_kind(str(updates["kind"])):
-                target = get_or_create_catalog(
-                    str(current["group_id"]), str(updates["kind"]), conn=conn
-                )
-                doc_sets.append("catalog_id = %s::uuid")
-                doc_params.append(target["id"])
 
         if source_patch:
             doc_sets.append("source = source || %s::jsonb")

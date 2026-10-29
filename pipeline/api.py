@@ -2319,7 +2319,7 @@ async def patch_scheme_metadata(
     user: RequireReview,
 ):
     """
-    Set kind / code / name / aliases used by Master Catalog and Qdrant scheme promote.
+    Set code / name / aliases / validity used by Master Catalog and Qdrant scheme promote.
 
     On completed docs, renaming the code sets pending_reindex (excluded from live
     vector_schemes until re-promote). Other metadata edits bump catalog version only.
@@ -2328,7 +2328,6 @@ async def patch_scheme_metadata(
     try:
         result = scheme_catalog.apply_scheme_metadata(
             workflow_id,
-            kind=body.kind,
             code=body.code,
             name=body.name,
             aliases=body.aliases,

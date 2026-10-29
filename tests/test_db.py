@@ -1100,18 +1100,13 @@ class TestCatalogView:
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_changing_the_kind_moves_the_document_and_rejects_unknown_kinds(self, db_connection):
+    def test_the_kind_is_fixed_by_the_catalog_chosen_at_upload(self, db_connection):
         _new_doc(db_connection, "wf-move", kind="scheme", code="movable", name="Movable")
         before = db_connection.get_document("wf-move")["catalog_id"]
-        db_connection.update_document_fields("wf-move", kind="advisory")
+        db_connection.update_document_fields("wf-move", kind="advisory", name="Renamed")
         doc = db_connection.get_document("wf-move")
-        assert (doc["kind"], doc["code"], doc["name"]) == (
-            "advisory", "movable", "Movable",
-        )
-        assert doc["catalog_id"] != before
-        with pytest.raises(ValueError):
-            db_connection.update_document_fields("wf-move", kind="document")
-        assert db_connection.get_document("wf-move")["kind"] == "advisory"
+        assert (doc["kind"], doc["code"], doc["name"]) == ("scheme", "movable", "Renamed")
+        assert doc["catalog_id"] == before
 
     @pytest.mark.db
     @pytest.mark.unit

@@ -91,6 +91,7 @@ class TestGroups:
                 "INSERT INTO audit_logs (action_type, entity_type, group_id) VALUES ('x', 'setting', %s::uuid)",
                 (group_id,),
             )
+            conn.execute("DELETE FROM catalogs WHERE group_id = %s::uuid", (group_id,))
             conn.execute("DELETE FROM groups WHERE id = %s::uuid", (group_id,))
             assert conn.execute("SELECT group_id FROM audit_logs WHERE action_type = 'x'").fetchone()["group_id"] is None
         assert db.get_user_by_keycloak_id("kc-zz")["group_id"] is None
@@ -99,13 +100,77 @@ class TestGroups:
 class TestCatalogs:
     @pytest.mark.db
     @pytest.mark.unit
+    def test_a_new_group_gets_one_catalog_per_supported_type(self, db_connection):
+        from pipeline.network_constants import KIND_TO_CATALOG_TYPE
+
+        db = db_connection
+        mh = _group(db, "mh")
+        with db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT type, name FROM catalogs WHERE group_id = %s::uuid ORDER BY type", (mh,)
+            ).fetchall()
+        assert [r["type"] for r in rows] == sorted(KIND_TO_CATALOG_TYPE.values())
+        assert {r["name"] for r in rows} == {
+            "MH scheme catalog", "MH advisory catalog", "MH video catalog",
+        }
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_upload_uses_the_seeded_catalog_and_creates_none(self, db_connection):
+        db = db_connection
+        mh = _group(db, "mh")
+        with db.get_connection() as conn:
+            seeded = conn.execute(
+                "SELECT id FROM catalogs WHERE group_id = %s::uuid AND type = 'openagrinet:AgricultureResource'",
+                (mh,),
+            ).fetchone()["id"]
+            before = conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"]
+        _doc(db, "wf-seeded", group="mh", code="seeded")
+        assert db.get_document("wf-seeded")["catalog_id"] == str(seeded)
+        with db.get_connection() as conn:
+            assert conn.execute("SELECT count(*) AS n FROM catalogs").fetchone()["n"] == before
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_a_missing_catalog_is_created_on_demand(self, db_connection):
+        db = db_connection
+        mh = _group(db, "mh")
+        with db.get_connection() as conn:
+            conn.execute(
+                "DELETE FROM catalogs WHERE group_id = %s::uuid AND type = 'openagrinet:KnowledgeAdvisory'",
+                (mh,),
+            )
+        _doc(db, "wf-fallback", group="mh", code="fallback", kind="advisory")
+        assert db.get_document("wf-fallback")["kind"] == "advisory"
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_startup_sync_fills_missing_catalogs_for_every_group_and_is_idempotent(self, db_connection):
+        db = db_connection
+        mh, up = _group(db, "mh"), _group(db, "up")
+        with db.get_connection() as conn:
+            conn.execute("DELETE FROM catalogs WHERE type = 'openagrinet:VideoResource'")
+            conn.execute(
+                "DELETE FROM catalogs WHERE group_id = %s::uuid AND type = 'openagrinet:KnowledgeAdvisory'", (up,)
+            )
+        assert db.sync_catalogs_for_all_groups() == 3
+        assert db.sync_catalogs_for_all_groups() == 0
+        with db.get_connection() as conn:
+            counts = {
+                str(r["group_id"]): r["n"]
+                for r in conn.execute("SELECT group_id, count(*) AS n FROM catalogs GROUP BY group_id")
+            }
+        assert counts == {mh: 3, up: 3}
+
+    @pytest.mark.db
+    @pytest.mark.unit
     def test_get_or_create_catalog_is_idempotent_per_group_and_kind(self, db_connection):
         db = db_connection
         mh = _group(db, "mh")
         scheme = db.get_or_create_catalog(mh, "scheme")
         assert db.get_or_create_catalog(mh, "scheme")["id"] == scheme["id"]
         assert scheme["type"] == "openagrinet:AgricultureResource"
-        assert scheme["name"] == "mh scheme"
+        assert scheme["name"] == "MH scheme catalog"
         advisory = db.get_or_create_catalog(mh, "advisory")
         assert advisory["id"] != scheme["id"]
         assert advisory["type"] == "openagrinet:KnowledgeAdvisory"
@@ -240,28 +305,13 @@ class TestDocumentIdentity:
 
     @pytest.mark.db
     @pytest.mark.unit
-    def test_changing_the_kind_moves_the_document_within_its_group(self, db_connection):
+    def test_the_kind_does_not_change_after_the_document_exists(self, db_connection):
         db = db_connection
-        _doc(db, "wf-kind", group="mh", code="movable")
+        _doc(db, "wf-kind", group="mh", code="fixed")
+        before = db.get_document("wf-kind")["catalog_id"]
         db.update_document_fields("wf-kind", kind="advisory")
         doc = db.get_document("wf-kind")
-        assert doc["kind"] == "advisory"
-        with db.get_connection() as conn:
-            row = conn.execute(
-                "SELECT c.group_id, c.type FROM catalogs c WHERE c.id = %s::uuid", (doc["catalog_id"],)
-            ).fetchone()
-        assert str(row["group_id"]) == _group(db, "mh")
-        assert row["type"] == "openagrinet:KnowledgeAdvisory"
-
-    @pytest.mark.db
-    @pytest.mark.unit
-    def test_moving_to_a_kind_that_already_holds_the_code_is_a_duplicate(self, db_connection):
-        db = db_connection
-        _doc(db, "wf-s", group="mh", code="same")
-        _doc(db, "wf-a", group="mh", code="same", kind="advisory")
-        with pytest.raises(db.DuplicateDocumentCode):
-            db.update_document_fields("wf-s", kind="advisory")
-        assert db.get_document("wf-s")["kind"] == "scheme"
+        assert (doc["kind"], doc["catalog_id"]) == ("scheme", before)
 
 
 class TestReupload:

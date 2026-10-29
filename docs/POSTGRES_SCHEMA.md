@@ -149,7 +149,7 @@ Pydantic (`CatalogMetadata`) validates the keys; the database only checks for an
 
 Notes
 - `type` stores the schema name, and code asks `pipeline/network_constants.py` what it means (`catalog_type_for_kind`, `kind_for_catalog_type`) instead of comparing `openagrinet:*` strings. The mapping is a placeholder: `scheme` is `openagrinet:AgricultureResource`, `advisory` is `openagrinet:KnowledgeAdvisory`, `video` is `openagrinet:VideoResource` (see ADR 0003 and ADR 0006).
-- Catalogs are created on upload (`get_or_create_catalog`), not seeded.
+- Every group gets one catalog per supported type when the group row is created (`upsert_group` calls `ensure_group_catalogs` in the same transaction). Startup (`init_db`) runs `sync_catalogs_for_all_groups`, so a type added to `KIND_TO_CATALOG_TYPE` reaches existing groups. Upload keeps `get_or_create_catalog` as a fallback for a catalog that is missing. Names are `<GROUP> <kind> catalog`, for example `MH scheme catalog`.
 - Computed catalog values (status, chunk count, network visibility, `promoted_at`) come from the `catalog_status` view, not stored here.
 
 ---
@@ -234,7 +234,7 @@ Column default: `'{"index_status": {}, "catalog_visible": true, "network_visible
 - The API's `group` is derived: `documents.catalog_id → catalogs.group_id → groups.name`. There is no `documents.instance` column, and tenant filters join `groups`.
 - The API's `document_kind` is derived from `catalogs.type` through the map in `network_constants.py`. `scheme_code`, `scheme_name` and `scheme_aliases` are `code`, `name` and `aliases`.
 - `chunk_count` and `page_count` are counted from `chunks` and `pages`; they are not stored.
-- A new document needs a `document_kind` and a `code`. Upload gets the catalog from the tenant and the kind (created when missing). `DuplicateDocumentCode` is raised when the code is taken in that catalog.
+- A new document needs a `document_kind` and a `code`. Upload gets the catalog from the tenant and the kind (seeded with the group; created when missing). A document's kind is fixed after upload, so there is no kind change. `DuplicateDocumentCode` is raised when the code is taken in that catalog.
 - Re-uploading an existing code updates the same document: a new workflow starts, `source` is replaced, pages and chunks are cleared and `reindex_required` is set (`reset_document_for_reupload`). Earlier workflows and artifacts stay as history.
 - Changing a document's kind moves it to the same group's catalog of the new type (`update_document_fields(document_kind=...)`).
 - SQL does not check types inside the JSONB columns. The insert path writes the default metadata keys, and Pydantic validates `source`, `metadata` and each `index_status` entry.
