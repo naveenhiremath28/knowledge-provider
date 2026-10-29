@@ -695,8 +695,7 @@ def _prepare_records(
             "workflow_id": workflow_id or "",
             "instance": resolved_group,  # vector payload key, kept for consumers
             "instance_name": group_name,
-            "type": "scheme" if is_scheme else "document",
-            "document_kind": kind,
+            "type": kind,
             "source": "docs-pipeline",
             "filename": external_slug,
             "name_gu": name_gu,

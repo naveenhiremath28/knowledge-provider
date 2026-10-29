@@ -50,6 +50,7 @@ def test_prepare_records_includes_provenance_fields():
     assert record["name_en"] == "Sample Circular"
     assert record["source"] == "docs-pipeline"
     assert record["type"] == "document"
+    assert "document_kind" not in record
     assert "text" in record
     assert record["is_reference"] is False
 

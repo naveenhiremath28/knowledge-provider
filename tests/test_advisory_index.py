@@ -144,9 +144,10 @@ def test_payload_whitelist_keeps_advisory_fields():
     chunk = build_chunks(make_row(), _count)[0]
     payload = _record_payload(chunk)
     for key in (
-        "document_kind", "external_id", "pop_id", "slug", "crop", "domain", "subdomain",
+        "type", "external_id", "pop_id", "slug", "crop", "domain", "subdomain",
         "institute", "creator", "problem_type", "problem", "season", "start_period",
         "end_period", "updated_at", "section", "chunk_id", "text", "doc_id", "title_en",
     ):
         assert key in payload, key
-    assert payload["document_kind"] == "advisory"
+    assert payload["type"] == "advisory"
+    assert "document_kind" not in payload

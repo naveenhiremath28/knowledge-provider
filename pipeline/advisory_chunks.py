@@ -77,8 +77,7 @@ def build_chunks(
     base = {
         "doc_id": doc_id,
         "workflow_id": "",
-        "type": "document",
-        "document_kind": "advisory",
+        "type": "advisory",
         "source": "webhook",
         "title_en": title,
         "slug": clean_value(row.get("slug")),

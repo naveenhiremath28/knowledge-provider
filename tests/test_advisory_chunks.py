@@ -184,8 +184,8 @@ class TestPublishingAndShape:
 
     def test_metadata_fields(self):
         chunk = build_chunks(make_row(), lambda t: 250)[0]
-        assert chunk["document_kind"] == "advisory"
-        assert chunk["type"] == "document"
+        assert "document_kind" not in chunk
+        assert chunk["type"] == "advisory"
         assert chunk["source"] == "webhook"
         assert chunk["workflow_id"] == ""
         assert chunk["doc_id"] == "row-1"

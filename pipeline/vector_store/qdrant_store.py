@@ -53,8 +53,7 @@ PAYLOAD_FIELDS = (
     "scheme_aliases",
     "chunk_id",
     "chunk_index",
-    # Advisory payload (document_kind=advisory; webhook records and PDF advisory documents)
-    "document_kind",
+    # Advisory payload (type=advisory; webhook records and PDF advisory documents)
     "external_id",
     "pop_id",
     "slug",

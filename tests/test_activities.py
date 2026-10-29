@@ -173,8 +173,8 @@ class TestPrepareIngestionRecords:
             assert records[0]["instance_name"] == expected
 
     @pytest.mark.unit
-    def test_prepare_records_carries_document_kind(self):
-        """Every record carries its document_kind; only scheme documents get type=scheme."""
+    def test_prepare_records_type_carries_kind(self):
+        """Every record's payload type is its kind; document_kind is not written."""
         from pipeline.activities import _prepare_records
         from pipeline.vector_store.qdrant_store import _record_payload
 
@@ -183,12 +183,13 @@ class TestPrepareIngestionRecords:
         advisory = _prepare_records(
             document_id="test-doc", filename="test.pdf", chunks=chunks, kind="advisory"
         )
-        assert advisory[0]["document_kind"] == "advisory"
-        assert advisory[0]["type"] == "document"
-        assert _record_payload(advisory[0])["document_kind"] == "advisory"
+        assert advisory[0]["type"] == "advisory"
+        assert "document_kind" not in advisory[0]
+        assert _record_payload(advisory[0])["type"] == "advisory"
+        assert "document_kind" not in _record_payload(advisory[0])
 
         default = _prepare_records(document_id="test-doc", filename="test.pdf", chunks=chunks)
-        assert default[0]["document_kind"] == "document"
+        assert default[0]["type"] == "document"
 
         scheme = _prepare_records(
             document_id="test-doc",
@@ -199,7 +200,7 @@ class TestPrepareIngestionRecords:
             name="PM-KISAN",
         )
         assert scheme[0]["type"] == "scheme"
-        assert scheme[0]["document_kind"] == "scheme"
+        assert "document_kind" not in scheme[0]
 
     @pytest.mark.unit
     def test_prepare_records_fills_scheme_aliases(self):

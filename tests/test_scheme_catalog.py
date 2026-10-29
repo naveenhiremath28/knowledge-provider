@@ -218,7 +218,21 @@ def test_prepare_records_document_unchanged():
         kind="document",
     )
     assert records[0]["type"] == "document"
+    assert "document_kind" not in records[0]
     assert "scheme_code" not in records[0]
+
+
+@pytest.mark.parametrize(
+    "kind,expected",
+    [("advisory", "advisory"), ("video", "video"), (" Advisory ", "advisory")],
+)
+def test_prepare_records_type_equals_kind(kind, expected):
+    from pipeline.activities import _prepare_records
+
+    chunks = [{"chunk_number": 0, "original_text": "Some text.", "token_count": 3, "is_excluded": False}]
+    records = _prepare_records("doc3", "x.pdf", chunks, kind=kind)
+    assert records[0]["type"] == expected
+    assert "document_kind" not in records[0]
 
 
 @pytest.fixture
